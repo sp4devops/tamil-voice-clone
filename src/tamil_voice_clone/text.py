@@ -34,7 +34,12 @@ def normalize_text(text: str) -> TextProfile:
     normalized = _SPACE_RE.sub(" ", normalized)
 
     for source, replacement in _TECH_NORMALIZATIONS.items():
-        normalized = re.sub(rf"\b{re.escape(source)}\b", replacement, normalized, flags=re.I)
+        normalized = re.sub(
+            rf"\b{re.escape(source)}\b",
+            replacement,
+            normalized,
+            flags=re.IGNORECASE,
+        )
 
     return TextProfile(
         normalized=normalized,
