@@ -3,11 +3,16 @@ name: voice-001-dhee-baseline
 on:
   workflow_dispatch:
 
+concurrency:
+  group: voice-001-dhee-baseline
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
 jobs:
   synthesize:
+    if: ${{ github.event.repository.private == false }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
@@ -95,16 +100,26 @@ jobs:
             --cases eval/voice_001_baseline_cases.json \
             --output-dir outputs/voice_001_dhee
 
+      - name: Encrypt generated samples
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -czf outputs/voice_001_dhee.tar.gz -C outputs voice_001_dhee
+          openssl enc -aes-256-cbc -pbkdf2 -iter 250000 -salt \
+            -in outputs/voice_001_dhee.tar.gz \
+            -out outputs/voice_001_dhee.tar.gz.enc \
+            -pass env:VOICE_001_KEY
+          rm -rf outputs/voice_001_dhee outputs/voice_001_dhee.tar.gz
+
       - name: Remove private reference
         if: always()
         shell: bash
         run: rm -rf data/private
 
-      - name: Upload generated samples and report
-        if: always()
+      - name: Upload encrypted samples and report
         uses: actions/upload-artifact@v4
         with:
-          name: voice-001-dhee-baseline
-          path: outputs/voice_001_dhee/
+          name: voice-001-dhee-baseline-encrypted
+          path: outputs/voice_001_dhee.tar.gz.enc
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 1
