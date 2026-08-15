@@ -21,6 +21,9 @@ dev = [
 onnx = [
   "onnxruntime>=1.18,<2",
 ]
+speaker = [
+  "sherpa-onnx>=1.12,<2",
+]
 
 [project.scripts]
 tvc = "tamil_voice_clone.cli:main"
