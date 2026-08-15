@@ -1,0 +1,209 @@
+name: voice-001-parler-seed-vc
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/voice-001-parler-seed-vc.yml'
+
+concurrency:
+  group: voice-001-parler-seed-vc
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  synthesize:
+    if: ${{ github.event.repository.private == false }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HUGGING_FACE_HUB_TOKEN: ${{ secrets.HF_TOKEN }}
+      VOICE_001_KEY: ${{ secrets.VOICE_001_KEY }}
+      VOICE_001_REF_B64: ${{ secrets.VOICE_001_REF_B64 }}
+      HF_HOME: ${{ github.workspace }}/.hf-cache
+      TOKENIZERS_PARALLELISM: 'false'
+      OMP_NUM_THREADS: '4'
+      MKL_NUM_THREADS: '4'
+
+    steps:
+      - name: Checkout benchmark branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/bootstrap-zero-shot-tts
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install system dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg libsndfile1 git
+          python -m pip install --upgrade pip
+
+      - name: Install Indic Parler dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          pip install --index-url https://download.pytorch.org/whl/cpu \
+            'torch==2.4.0' 'torchaudio==2.4.0' 'torchvision==0.19.0'
+          pip install \
+            'transformers==4.46.3' \
+            'accelerate==1.1.1' \
+            'numpy==1.26.4' \
+            'soundfile==0.12.1' \
+            'sentencepiece>=0.2,<1' \
+            'protobuf>=4.25,<6' \
+            'psutil==6.1.0'
+          pip install --no-deps \
+            'git+https://github.com/huggingface/parler-tts.git@d108732cd57788ec86bc857d99a6cabd66663d68'
+          pip install 'descript-audio-codec==1.0.0'
+          python -c 'import torch, transformers, parler_tts; print(torch.__version__, transformers.__version__, parler_tts.__file__)'
+
+      - name: Validate protected inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$HF_TOKEN"
+          test -n "$VOICE_001_KEY"
+          test -n "$VOICE_001_REF_B64"
+
+      - name: Restore private voice reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data/private outputs/reports
+          printf '%s' "$VOICE_001_REF_B64" | base64 --decode > data/private/voice_001_ref.opus.enc
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 250000 \
+            -in data/private/voice_001_ref.opus.enc \
+            -out data/private/voice_001_ref.opus \
+            -pass env:VOICE_001_KEY
+          ffmpeg -y -hide_banner -loglevel error \
+            -i data/private/voice_001_ref.opus \
+            -ac 1 -ar 24000 data/private/voice_001_ref.wav
+          ffprobe -v error -show_entries stream=sample_rate,channels:format=duration \
+            -of json data/private/voice_001_ref.wav > outputs/reports/reference_info.json
+
+      - name: Generate pronunciation-first source speech
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p outputs/parler_sources
+          python scripts/run_with_memory_cap.py \
+            --limit-mib 7900 \
+            --report outputs/reports/parler_memory.json \
+            -- python scripts/generate_indic_parler_sources.py \
+              --cases eval/voice_001_parler_seed_cases.json \
+              --output-dir outputs/parler_sources \
+              --model-id ai4bharat/indic-parler-tts
+
+      - name: Release Parler model disk cache
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$HF_HOME/hub/models--ai4bharat--indic-parler-tts"
+          python -m pip cache purge || true
+          df -h
+
+      - name: Install pinned Seed-VC v2
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/Plachtaa/seed-vc.git vendor/seed-vc
+          git -C vendor/seed-vc checkout 51383efd921027683c89e5348211d93ff12ac2a8
+          pip install \
+            'scipy==1.13.1' \
+            'librosa==0.10.2' \
+            'huggingface-hub>=0.28.1,<1' \
+            'munch==4.0.0' \
+            'einops==0.8.0' \
+            'pydub==0.25.1' \
+            'resemblyzer==0.1.4' \
+            'jiwer==3.0.3' \
+            'hydra-core==1.3.2' \
+            'pyyaml>=6,<7' \
+            'python-dotenv>=1,<2'
+          python -c 'import hydra, librosa, soundfile, torch; print("Seed-VC dependencies ready")'
+
+      - name: Convert all sources to the private target voice
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          mkdir -p outputs/final_voice
+          python scripts/run_with_memory_cap.py \
+            --limit-mib 7900 \
+            --report outputs/reports/seed_vc_memory.json \
+            -- python scripts/run_seed_vc_batch.py \
+              --seed-vc-dir vendor/seed-vc \
+              --source-dir outputs/parler_sources \
+              --reference data/private/voice_001_ref.wav \
+              --output-dir outputs/final_voice \
+              --diffusion-steps 40 \
+              --intelligibility 0.85 \
+              --similarity 0.90
+
+      - name: Validate generated waveforms
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          import numpy as np
+          import soundfile as sf
+
+          rows = []
+          for path in sorted(Path('outputs/final_voice').glob('*.wav')):
+              audio, sr = sf.read(path, dtype='float32', always_2d=False)
+              audio = np.asarray(audio).squeeze()
+              assert audio.ndim == 1, f'{path}: not mono'
+              assert len(audio) >= sr // 2, f'{path}: too short'
+              assert np.isfinite(audio).all(), f'{path}: non-finite samples'
+              peak = float(np.max(np.abs(audio)))
+              rms = float(np.sqrt(np.mean(audio ** 2)))
+              assert peak > 0.01, f'{path}: near-silent'
+              assert peak <= 1.0, f'{path}: clipping'
+              assert rms > 0.001, f'{path}: DC/silent output'
+              rows.append({'file': path.name, 'sample_rate': sr, 'duration_seconds': round(len(audio)/sr, 3), 'peak': round(peak, 6), 'rms': round(rms, 6)})
+          assert len(rows) == 4, f'Expected 4 outputs, found {len(rows)}'
+          Path('outputs/reports/waveform_validation.json').write_text(json.dumps(rows, indent=2), encoding='utf-8')
+          print(json.dumps(rows, indent=2))
+          PY
+
+      - name: Encrypt private outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p outputs/package
+          cp -a outputs/final_voice outputs/package/
+          cp -a outputs/parler_sources outputs/package/
+          cp -a outputs/reports outputs/package/
+          tar -czf outputs/voice_001_parler_seed_vc.tar.gz -C outputs package
+          openssl enc -aes-256-cbc -pbkdf2 -iter 250000 -salt \
+            -in outputs/voice_001_parler_seed_vc.tar.gz \
+            -out outputs/voice_001_parler_seed_vc.tar.gz.enc \
+            -pass env:VOICE_001_KEY
+          rm -rf outputs/package outputs/final_voice outputs/parler_sources outputs/voice_001_parler_seed_vc.tar.gz
+
+      - name: Remove private material
+        if: always()
+        shell: bash
+        run: |
+          rm -rf data/private "$HF_HOME"
+
+      - name: Upload encrypted benchmark
+        uses: actions/upload-artifact@v4
+        with:
+          name: voice-001-parler-seed-vc-encrypted
+          path: outputs/voice_001_parler_seed_vc.tar.gz.enc
+          if-no-files-found: error
+          retention-days: 1
