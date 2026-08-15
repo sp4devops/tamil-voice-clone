@@ -255,6 +255,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: voice-001-parler-seed-vc-encrypted
-          path: outputs/voice_001_parler_seed-vc.tar.gz.enc
+          path: outputs/voice_001_parler_seed_vc.tar.gz.enc
           if-no-files-found: error
           retention-days: 1
