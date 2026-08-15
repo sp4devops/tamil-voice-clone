@@ -3,12 +3,29 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import time
 from pathlib import Path
 
 import numpy as np
 import soundfile as sf
+from huggingface_hub import hf_hub_download, snapshot_download
 from transformers import AutoModel
+
+COMPATIBLE_CONFIG = {
+    "architectures": ["INF5Model"],
+    "auto_map": {
+        "AutoConfig": "model.INF5Config",
+        "AutoModel": "model.INF5Model",
+    },
+    "ckpt_path": "checkpoints/model_best.pt",
+    "model_type": "inf5",
+    "remove_sil": True,
+    "speed": 1.0,
+    "torch_dtype": "float32",
+    "transformers_version": "4.49.0",
+    "vocab_path": "checkpoints/vocab.txt",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -18,7 +35,56 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cases", default="eval/voice_001_baseline_cases.json")
     parser.add_argument("--output-dir", default="outputs/voice_001_dhee")
     parser.add_argument("--model-id", default="dheeyantra/dhee-indic-f5")
+    parser.add_argument("--compat-model-id", default="Anjan9320/IndicF5")
     return parser.parse_args()
+
+
+def prepare_compatible_snapshot(model_id: str, compat_model_id: str, token: str | None) -> Path:
+    """Repair model metadata while preserving the requested Dhee weights.
+
+    Dhee-Indic-F5 currently publishes weights with an incomplete Transformers
+    config. The architecture is unchanged from IndicF5, so copy the public
+    IndicF5 remote-code loader and inject the standard INF5 config locally.
+    """
+
+    snapshot = Path(
+        snapshot_download(
+            repo_id=model_id,
+            token=token,
+            allow_patterns=[
+                "model.safetensors",
+                "checkpoints/*",
+                "f5_tts/*",
+                "f5_tts/**/*",
+            ],
+        )
+    )
+    model_py = Path(
+        hf_hub_download(
+            repo_id=compat_model_id,
+            filename="model.py",
+            token=token,
+        )
+    )
+    local_model_py = snapshot / "model.py"
+    shutil.copyfile(model_py, local_model_py)
+
+    # The upstream loader downloads weights/vocabulary through name_or_path.
+    # A local repaired snapshot changes name_or_path to a filesystem path, so
+    # force those asset lookups back to the requested Dhee repository.
+    source = local_model_py.read_text(encoding="utf-8")
+    source = source.replace(
+        "hf_hub_download(config.name_or_path,",
+        "hf_hub_download(os.environ.get('INDICF5_WEIGHTS_REPO', config.name_or_path),",
+    )
+    local_model_py.write_text(source, encoding="utf-8")
+
+    (snapshot / "config.json").write_text(
+        json.dumps(COMPATIBLE_CONFIG, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    os.environ["INDICF5_WEIGHTS_REPO"] = model_id
+    return snapshot
 
 
 def main() -> None:
@@ -30,10 +96,11 @@ def main() -> None:
     token = os.environ.get("HF_TOKEN") or None
 
     started = time.perf_counter()
+    snapshot = prepare_compatible_snapshot(args.model_id, args.compat_model_id, token)
     model = AutoModel.from_pretrained(
-        args.model_id,
+        snapshot,
         trust_remote_code=True,
-        token=token,
+        local_files_only=True,
     )
     load_seconds = time.perf_counter() - started
 
