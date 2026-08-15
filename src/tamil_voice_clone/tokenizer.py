@@ -45,7 +45,7 @@ class PhonemeVocabulary:
         self.to_id = {symbol: index for index, symbol in enumerate(self.symbols)}
 
     @classmethod
-    def from_spans(cls, utterances: list[list[PhonemeSpan]]) -> "PhonemeVocabulary":
+    def from_spans(cls, utterances: list[list[PhonemeSpan]]) -> PhonemeVocabulary:
         symbols: set[str] = set()
         for spans in utterances:
             for span in spans:
@@ -75,7 +75,7 @@ class PhonemeVocabulary:
         )
 
     @classmethod
-    def load(cls, path: Path) -> "PhonemeVocabulary":
+    def load(cls, path: Path) -> PhonemeVocabulary:
         payload = json.loads(path.read_text(encoding="utf-8"))
         if int(payload.get("version", 0)) != 1:
             raise ValueError("Unsupported phoneme vocabulary version")
