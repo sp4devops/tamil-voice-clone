@@ -1,0 +1,108 @@
+name: voice-001-identity-tuning
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/voice-001-identity-tuning.yml'
+
+concurrency:
+  group: voice-001-identity-tuning
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  tune:
+    if: ${{ github.event.repository.private == false }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      VOICE_001_KEY: ${{ secrets.VOICE_001_KEY }}
+      VOICE_001_REF_B64: ${{ secrets.VOICE_001_REF_B64 }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/bootstrap-zero-shot-tts
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install inference dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu \
+            'torch==2.6.0' 'torchaudio==2.6.0'
+          pip install \
+            'transformers==4.49.0' 'accelerate==0.33.0' \
+            'numpy==1.26.4' 'soundfile>=0.12,<1' \
+            'huggingface-hub>=0.27,<1' 'safetensors>=0.4.5' \
+            'vocos==0.1.0' 'pydub==0.25.1' 'librosa>=0.10.2,<1' \
+            'matplotlib>=3.8,<4' 'torchdiffeq>=0.2.4' \
+            'ema-pytorch>=0.5.2' 'x-transformers>=1.31.14' \
+            cached_path click hydra-core jieba pypinyin tomli tqdm
+          pip install --no-deps git+https://github.com/AI4Bharat/IndicF5.git
+          python - <<'PY'
+          from pathlib import Path
+          import f5_tts
+          model_init = Path(f5_tts.__file__).parent / 'model' / '__init__.py'
+          source = model_init.read_text(encoding='utf-8')
+          source = source.replace('from f5_tts.model.trainer import Trainer\n', '')
+          source = source.replace(', "Trainer"', '')
+          model_init.write_text(source, encoding='utf-8')
+          PY
+
+      - name: Restore private reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$VOICE_001_KEY"
+          test -n "$VOICE_001_REF_B64"
+          mkdir -p data/private
+          printf '%s' "$VOICE_001_REF_B64" | base64 --decode > data/private/ref.opus.enc
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 250000 \
+            -in data/private/ref.opus.enc -out data/private/ref.opus \
+            -pass env:VOICE_001_KEY
+          ffmpeg -y -hide_banner -loglevel error -i data/private/ref.opus \
+            -ac 1 -ar 24000 data/private/ref.wav
+
+      - name: Generate identity candidates
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/run_dhee_identity_tuning.py \
+            --reference data/private/ref.wav \
+            --output-dir outputs/voice_001_identity_tuning
+
+      - name: Encrypt candidates
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -czf outputs/voice_001_identity_tuning.tar.gz -C outputs voice_001_identity_tuning
+          openssl enc -aes-256-cbc -pbkdf2 -iter 250000 -salt \
+            -in outputs/voice_001_identity_tuning.tar.gz \
+            -out outputs/voice_001_identity_tuning.tar.gz.enc \
+            -pass env:VOICE_001_KEY
+          rm -rf outputs/voice_001_identity_tuning outputs/voice_001_identity_tuning.tar.gz
+
+      - name: Remove private reference
+        if: always()
+        shell: bash
+        run: rm -rf data/private
+
+      - name: Upload encrypted candidates
+        uses: actions/upload-artifact@v4
+        with:
+          name: voice-001-identity-tuning-encrypted
+          path: outputs/voice_001_identity_tuning.tar.gz.enc
+          if-no-files-found: error
+          retention-days: 1
