@@ -1,0 +1,20 @@
+{
+  "id": "voice_001",
+  "label": "first-evaluation-voice",
+  "raw_audio_committed": false,
+  "local_reference_filename": "tY_3TiehDFU_0330-0400_enhanced.wav",
+  "sha256": "8c6a438ea4ed6b730e4c2ea08cd1b0f8b8ed32f3d74c9b4981a4de119b382986",
+  "duration_seconds": 30.0,
+  "sample_rate_hz": 48000,
+  "channels": 1,
+  "bit_depth": 24,
+  "peak_abs": 0.8915743828,
+  "rms": 0.1299313605,
+  "clipped_sample_ratio": 0.0,
+  "dc_offset": -0.0000028642,
+  "notes": [
+    "Suitable as an initial speaker-identity reference.",
+    "Audio is enhanced/processed; compare with an unprocessed clean recording later to detect enhancement-induced timbre drift.",
+    "Do not publish the raw recording in this public repository."
+  ]
+}
