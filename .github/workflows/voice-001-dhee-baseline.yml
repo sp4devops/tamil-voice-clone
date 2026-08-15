@@ -1,0 +1,91 @@
+name: voice-001-dhee-baseline
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  synthesize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      VOICE_001_KEY: ${{ secrets.VOICE_001_KEY }}
+      VOICE_001_REF_B64: ${{ secrets.VOICE_001_REF_B64 }}
+      VOICE_001_REF_TEXT: ${{ secrets.VOICE_001_REF_TEXT }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install system and inference dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python -m pip install --upgrade pip
+          pip install \
+            'transformers>=4.49,<5' \
+            'accelerate>=0.33,<2' \
+            'torch>=2.4,<3' \
+            'torchaudio>=2.4,<3' \
+            'soundfile>=0.12,<1' \
+            'numpy>=1.26,<3' \
+            'vocos>=0.1.0' \
+            'pydub>=0.25.1' \
+            'librosa>=0.10.2' \
+            'safetensors>=0.4.5'
+
+      - name: Validate protected inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$VOICE_001_KEY"
+          test -n "$VOICE_001_REF_B64"
+          test -n "$VOICE_001_REF_TEXT"
+
+      - name: Restore private reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data/private
+          printf '%s' "$VOICE_001_REF_B64" | base64 --decode > data/private/voice_001_ref.opus.enc
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 250000 \
+            -in data/private/voice_001_ref.opus.enc \
+            -out data/private/voice_001_ref.opus \
+            -pass env:VOICE_001_KEY
+          ffmpeg -y -hide_banner -loglevel error \
+            -i data/private/voice_001_ref.opus \
+            -ac 1 -ar 24000 data/private/voice_001_ref.wav
+          ffprobe -v error -show_entries format=duration \
+            -of default=noprint_wrappers=1:nokey=1 data/private/voice_001_ref.wav
+
+      - name: Generate Tamil English Tanglish samples
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/run_dhee_baseline.py \
+            --reference data/private/voice_001_ref.wav \
+            --reference-text "$VOICE_001_REF_TEXT" \
+            --cases eval/voice_001_baseline_cases.json \
+            --output-dir outputs/voice_001_dhee
+
+      - name: Remove private reference
+        if: always()
+        shell: bash
+        run: rm -rf data/private
+
+      - name: Upload generated samples and report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: voice-001-dhee-baseline
+          path: outputs/voice_001_dhee/
+          if-no-files-found: error
+          retention-days: 7

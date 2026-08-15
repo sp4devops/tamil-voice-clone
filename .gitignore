@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+
+# Downloaded model artifacts
+models/
+*.onnx
+*.pth
+*.pt
+*.ckpt
+
+# Private voice recordings and generated audio
+# Never commit a person's raw voice to this public repository.
+data/private/
+voices/private/
+outputs/
+*.wav
+*.flac
+*.mp3
+*.m4a
+*.npz
+
+# Allow deliberately versioned tiny test fixtures if added later
+!tests/fixtures/**/*.wav
+!tests/fixtures/**/*.npz

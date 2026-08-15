@@ -1,0 +1,69 @@
+{
+  "version": 1,
+  "voice_id": "voice_001",
+  "purpose": "Evaluate natural Tamil Nadu Tamil-English code switching in one cloned voice.",
+  "requirements": {
+    "single_pass_synthesis": true,
+    "no_language_audio_stitching": true,
+    "speaker_identity_must_remain_stable": true,
+    "no_garbled_words": true,
+    "no_dropped_or_repeated_words": true,
+    "technical_terms_use_indian_english_pronunciation": true
+  },
+  "sentences": [
+    {
+      "id": "ta_only_01",
+      "category": "tamil",
+      "text": "வணக்கம் தோழர்களே, இன்று நாம் ஒரு முக்கியமான விஷயத்தைப் பற்றி பேசப் போகிறோம்."
+    },
+    {
+      "id": "en_only_01",
+      "category": "english",
+      "text": "Today we are going to discuss an important production issue in a clear and practical way."
+    },
+    {
+      "id": "switch_ta_en_01",
+      "category": "code_switch",
+      "text": "இன்று production server ரொம்ப slow ஆக இருக்கு, அதனால் application logs எல்லாம் சரியாக check பண்ணுங்க."
+    },
+    {
+      "id": "switch_en_ta_01",
+      "category": "code_switch",
+      "text": "The MongoDB backup முடிந்ததும் restore process ஆரம்பிக்கலாம், ஆனால் முதலில் storage space check பண்ண வேண்டும்."
+    },
+    {
+      "id": "switch_dense_01",
+      "category": "dense_code_switch",
+      "text": "Machan, Kubernetes cluster down aagiduchu, Rabbit M Q connection timeout varuthu, so pod logs and network policy rendu check pannunga."
+    },
+    {
+      "id": "switch_dense_02",
+      "category": "dense_code_switch",
+      "text": "Deployment successful-nu dashboard காட்டுது, but users login panna முடியல, அதனால் API gateway, database connection, and cache status verify pannunga."
+    },
+    {
+      "id": "names_numbers_01",
+      "category": "names_numbers",
+      "text": "திரு ஸ்டாலின் அவர்கள் 2006, 2011, மற்றும் 2021 தேர்தல்களில் தாக்கல் செய்த விவரங்களை compare பண்ணிப் பாருங்கள்."
+    },
+    {
+      "id": "technical_01",
+      "category": "technical",
+      "text": "Terraform plan complete ஆன பிறகு Ansible playbook run பண்ணி, Nginx, Postgre S Q L, Mongo D B, Elasticsearch, and Prometheus services verify பண்ணுங்க."
+    }
+  ],
+  "human_rubric": {
+    "speaker_similarity": "1-5; reject below 4",
+    "pronunciation_accuracy": "1-5; reject any material word error",
+    "switch_smoothness": "1-5; reject below 4",
+    "naturalness": "1-5; reject below 4",
+    "intelligibility": "Every word must be understandable without transcript",
+    "identity_drift": "Reject if English and Tamil sound like different speakers"
+  },
+  "automatic_checks": {
+    "asr_word_error_rate": "Track separately for Tamil, English, and code-switched sets",
+    "speaker_embedding_similarity": "Compare every generated sentence to the reference voice embedding",
+    "boundary_similarity": "Measure embeddings in windows before and after every language switch",
+    "duration_anomalies": "Reject repeated, skipped, or abnormally stretched token regions"
+  }
+}

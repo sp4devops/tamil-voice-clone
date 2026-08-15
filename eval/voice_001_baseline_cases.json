@@ -1,0 +1,22 @@
+{
+  "voice_id": "voice_001",
+  "model_id": "dheeyantra/dhee-indic-f5",
+  "sample_rate_hz": 24000,
+  "cases": [
+    {
+      "id": "ta_natural",
+      "language": "ta",
+      "text": "தோழர்களே, இன்று நம்முடைய அமைப்பில் ஏற்பட்ட பிரச்சினையை கவனமாக ஆய்வு செய்து, சரியான தீர்வை தெளிவாக விளக்க வேண்டும்."
+    },
+    {
+      "id": "en_indian",
+      "language": "en-IN",
+      "text": "Today we will carefully review the production system, identify the actual problem, and explain the correct solution clearly."
+    },
+    {
+      "id": "ta_en_switch",
+      "language": "ta-en-IN",
+      "text": "தோழர்களே, இன்று production server ரொம்ப slow ஆக இருக்கு, அதனால் application logs, database connection, மற்றும் network policy எல்லாத்தையும் கவனமாக check பண்ணுங்க."
+    }
+  ]
+}
