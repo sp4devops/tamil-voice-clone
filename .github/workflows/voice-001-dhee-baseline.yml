@@ -104,6 +104,7 @@ jobs:
             --reference data/private/voice_001_ref.wav \
             --reference-text "$VOICE_001_REF_TEXT" \
             --cases eval/voice_001_baseline_cases.json \
+            --compat-model-id AbhishekDelMundu/IndicF5 \
             --output-dir outputs/voice_001_dhee
 
       - name: Encrypt generated samples
