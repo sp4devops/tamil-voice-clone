@@ -55,17 +55,37 @@ jobs:
           pip install --index-url https://download.pytorch.org/whl/cpu \
             'torch==2.4.0' 'torchaudio==2.4.0' 'torchvision==0.19.0'
           pip install \
-            'transformers==4.46.3' \
+            'transformers==4.46.1' \
             'accelerate==1.1.1' \
             'numpy==1.26.4' \
             'soundfile==0.12.1' \
             'sentencepiece>=0.2,<1' \
-            'protobuf>=4.25,<6' \
+            'protobuf==5.29.6' \
             'psutil==6.1.0'
           pip install --no-deps \
             'git+https://github.com/huggingface/parler-tts.git@d108732cd57788ec86bc857d99a6cabd66663d68'
           pip install 'descript-audio-codec==1.0.0'
-          python -c 'import torch, transformers, parler_tts; print(torch.__version__, transformers.__version__, parler_tts.__file__)'
+          # descript-audiotools installs an obsolete protobuf pin. Restore the
+          # versions required by Parler after DAC and its runtime dependencies.
+          pip install --upgrade --force-reinstall \
+            'transformers==4.46.1' 'protobuf==5.29.6'
+          python - <<'PY'
+          import google.protobuf
+          import torch
+          import transformers
+          import parler_tts
+          import dac
+
+          assert transformers.__version__ == '4.46.1', transformers.__version__
+          major = int(google.protobuf.__version__.split('.')[0])
+          assert major >= 4, google.protobuf.__version__
+          print(
+              'Parler runtime ready:',
+              'torch=' + torch.__version__,
+              'transformers=' + transformers.__version__,
+              'protobuf=' + google.protobuf.__version__,
+          )
+          PY
 
       - name: Validate protected inputs
         shell: bash
@@ -74,6 +94,37 @@ jobs:
           test -n "$HF_TOKEN"
           test -n "$VOICE_001_KEY"
           test -n "$VOICE_001_REF_B64"
+
+      - name: Verify Indic Parler gated-model access
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          from huggingface_hub import hf_hub_download
+          from huggingface_hub.errors import GatedRepoError, HfHubHTTPError
+
+          repo_id = 'ai4bharat/indic-parler-tts'
+          try:
+              path = hf_hub_download(
+                  repo_id=repo_id,
+                  filename='config.json',
+                  token=os.environ['HF_TOKEN'],
+              )
+          except GatedRepoError as exc:
+              raise SystemExit(
+                  'HF_TOKEN is valid but its Hugging Face account is not authorized '
+                  'for ai4bharat/indic-parler-tts. Log into the account that created '
+                  'the token, accept the model access terms, and ensure a fine-grained '
+                  'token has read access to gated repositories.'
+              ) from exc
+          except HfHubHTTPError as exc:
+              raise SystemExit(
+                  f'Hugging Face model access preflight failed with HTTP '
+                  f'{exc.response.status_code}; verify HF_TOKEN permissions.'
+              ) from exc
+          print(f'Gated-model access verified: {repo_id} ({path})')
+          PY
 
       - name: Restore private voice reference
         shell: bash
@@ -204,6 +255,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: voice-001-parler-seed-vc-encrypted
-          path: outputs/voice_001_parler_seed_vc.tar.gz.enc
+          path: outputs/voice_001_parler_seed-vc.tar.gz.enc
           if-no-files-found: error
           retention-days: 1
