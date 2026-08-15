@@ -12,6 +12,7 @@ import soundfile as sf
 from huggingface_hub import hf_hub_download, snapshot_download
 from transformers import AutoModel
 
+SAMPLE_RATE = 24000
 COMPATIBLE_CONFIG = {
     "architectures": ["INF5Model"],
     "auto_map": {
@@ -35,12 +36,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cases", default="eval/voice_001_baseline_cases.json")
     parser.add_argument("--output-dir", default="outputs/voice_001_dhee")
     parser.add_argument("--model-id", default="dheeyantra/dhee-indic-f5")
-    parser.add_argument("--compat-model-id", default="Anjan9320/IndicF5")
+    parser.add_argument("--compat-model-id", default="AbhishekDelMundu/IndicF5")
     return parser.parse_args()
 
 
 def prepare_compatible_snapshot(model_id: str, compat_model_id: str, token: str | None) -> Path:
-    """Repair Dhee metadata while retaining its weights and IndicF5 vocabulary."""
+    """Repair Dhee metadata while retaining its weights and IndicF5 vocabulary.
+
+    The compatibility model supplies a loader that correctly strips the
+    ``ema_model`` / ``_orig_mod`` safetensors prefixes before loading weights.
+    The previous loader accepted those keys with ``strict=False`` but silently
+    left the acoustic model effectively uninitialised.
+    """
 
     snapshot = Path(
         snapshot_download(
@@ -75,10 +82,9 @@ def prepare_compatible_snapshot(model_id: str, compat_model_id: str, token: str 
     shutil.copyfile(model_py, local_model_py)
     shutil.copyfile(vocab_file, local_vocab_path)
 
-    # The Dhee repository contains the fine-tuned safetensors weights but does
-    # not publish checkpoints/vocab.txt. Replace only the vocabulary download
-    # with the compatible local IndicF5 vocabulary, then preserve any remaining
-    # upstream asset lookups against the requested Dhee repository.
+    # Dhee publishes the fine-tuned safetensors weights but not vocab.txt.
+    # Keep all weights on Dhee and point only the vocabulary to the compatible
+    # local IndicF5 copy.
     source = local_model_py.read_text(encoding="utf-8")
     vocab_lookup = (
         'vocab_path = hf_hub_download(config.name_or_path, '
@@ -103,6 +109,38 @@ def prepare_compatible_snapshot(model_id: str, compat_model_id: str, token: str 
     os.environ["INDICF5_WEIGHTS_REPO"] = model_id
     os.environ["INDICF5_VOCAB_PATH"] = str(local_vocab_path.resolve())
     return snapshot
+
+
+def validate_waveform(waveform: np.ndarray, case_id: str) -> dict[str, float | int]:
+    """Reject silence, DC-only output, NaNs and implausibly short waveforms."""
+
+    if waveform.size < SAMPLE_RATE // 2:
+        raise RuntimeError(f"{case_id}: waveform is shorter than 0.5 seconds")
+    if not np.isfinite(waveform).all():
+        raise RuntimeError(f"{case_id}: waveform contains NaN or infinity")
+
+    peak = float(np.max(np.abs(waveform)))
+    mean = float(np.mean(waveform))
+    ac_rms = float(np.std(waveform))
+    peak_to_peak = float(np.ptp(waveform))
+    unique_samples = int(np.unique(np.round(waveform, decimals=6)).size)
+
+    # Real speech has substantial AC variation. The failed baseline contained
+    # a constant -0.100006 signal: AC RMS 0 and only one unique sample value.
+    if ac_rms < 1e-4 or peak_to_peak < 1e-3 or unique_samples < 64:
+        raise RuntimeError(
+            f"{case_id}: invalid non-speech waveform "
+            f"(ac_rms={ac_rms:.8f}, peak_to_peak={peak_to_peak:.8f}, "
+            f"unique_samples={unique_samples}, mean={mean:.8f})"
+        )
+
+    return {
+        "peak": peak,
+        "mean": mean,
+        "ac_rms": ac_rms,
+        "peak_to_peak": peak_to_peak,
+        "unique_samples": unique_samples,
+    }
 
 
 def main() -> None:
@@ -134,10 +172,12 @@ def main() -> None:
         if waveform.dtype == np.int16:
             waveform = waveform.astype(np.float32) / 32768.0
         waveform = waveform.astype(np.float32).reshape(-1)
-        output_path = output_dir / f"{case['id']}.wav"
-        sf.write(output_path, waveform, samplerate=24000)
+        signal_metrics = validate_waveform(waveform, case["id"])
 
-        duration = len(waveform) / 24000
+        output_path = output_dir / f"{case['id']}.wav"
+        sf.write(output_path, waveform, samplerate=SAMPLE_RATE)
+
+        duration = len(waveform) / SAMPLE_RATE
         elapsed = time.perf_counter() - case_started
         results.append(
             {
@@ -148,13 +188,14 @@ def main() -> None:
                 "duration_seconds": duration,
                 "generation_seconds": elapsed,
                 "real_time_factor": elapsed / duration if duration else None,
-                "peak": float(np.max(np.abs(waveform))) if waveform.size else 0.0,
+                **signal_metrics,
             }
         )
 
     report = {
         "voice_id": payload["voice_id"],
         "model_id": args.model_id,
+        "compat_model_id": args.compat_model_id,
         "reference": Path(args.reference).name,
         "model_load_seconds": load_seconds,
         "results": results,
