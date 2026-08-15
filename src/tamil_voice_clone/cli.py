@@ -1,6 +1,10 @@
 import argparse
+from pathlib import Path
 
+from .assets import CAMPPLUS_VOXCELEB, download_asset
 from .audio import inspect_reference
+from .cache import save_voice_cache
+from .speaker import SherpaOnnxSpeakerEncoder, SpeakerEncoderConfig
 from .text import normalize_text
 
 
@@ -13,6 +17,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     normalize_cmd = sub.add_parser("normalize", help="Normalize Tamil/English/Tanglish text")
     normalize_cmd.add_argument("text")
+
+    download_cmd = sub.add_parser(
+        "download-speaker-model",
+        help="Download the lightweight ONNX speaker encoder",
+    )
+    download_cmd.add_argument("--dir", default="models", dest="directory")
+
+    encode_cmd = sub.add_parser(
+        "encode-speaker",
+        help="Create a reusable zero-shot speaker cache from reference speech",
+    )
+    encode_cmd.add_argument("reference")
+    encode_cmd.add_argument("--model", required=True)
+    encode_cmd.add_argument("--name", default="voice")
+    encode_cmd.add_argument("--output", required=True)
+    encode_cmd.add_argument("--threads", type=int, default=2)
     return parser
 
 
@@ -33,4 +53,26 @@ def main() -> None:
         print(
             f"tamil={profile.has_tamil} latin={profile.has_latin} "
             f"code_mixed={profile.is_code_mixed}"
+        )
+        return
+
+    if args.command == "download-speaker-model":
+        path = download_asset(CAMPPLUS_VOXCELEB, Path(args.directory))
+        print(path)
+        return
+
+    if args.command == "encode-speaker":
+        reference = Path(args.reference)
+        inspect_reference(reference)
+        encoder = SherpaOnnxSpeakerEncoder(
+            SpeakerEncoderConfig(
+                model_path=Path(args.model),
+                num_threads=args.threads,
+            )
+        )
+        condition = encoder.encode_speaker(reference)
+        info = save_voice_cache(Path(args.output), args.name, condition)
+        print(
+            f"saved={args.output} name={info.name} "
+            f"seconds={info.source_seconds:.1f} dims={info.embedding_size}"
         )
