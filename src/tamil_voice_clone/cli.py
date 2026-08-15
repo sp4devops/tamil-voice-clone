@@ -4,9 +4,12 @@ from pathlib import Path
 from .assets import CAMPPLUS_VOXCELEB, download_asset
 from .audio import inspect_reference
 from .cache import save_voice_cache
+from .onnx_synth import OnnxSynthesizer
 from .phonemes import EspeakPhonemizer, split_language_spans, tagged_phoneme_text
+from .pipeline import VoiceCloningPipeline
 from .speaker import SherpaOnnxSpeakerEncoder, SpeakerEncoderConfig
 from .text import normalize_text
+from .tokenizer import PhonemeVocabulary
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -47,6 +50,18 @@ def build_parser() -> argparse.ArgumentParser:
     encode_cmd.add_argument("--name", default="voice")
     encode_cmd.add_argument("--output", required=True)
     encode_cmd.add_argument("--threads", type=int, default=2)
+
+    synth_cmd = sub.add_parser(
+        "synthesize",
+        help="Synthesize speech with an exported compact ONNX model and cached voice",
+    )
+    synth_cmd.add_argument("text")
+    synth_cmd.add_argument("--model", required=True, help="Compact synthesizer ONNX model")
+    synth_cmd.add_argument("--vocab", required=True, help="Phoneme vocabulary JSON")
+    synth_cmd.add_argument("--voice", required=True, help="Cached speaker .npz file")
+    synth_cmd.add_argument("--output", required=True, help="Output WAV path")
+    synth_cmd.add_argument("--sample-rate", type=int, default=22050)
+    synth_cmd.add_argument("--espeak", default="espeak-ng")
     return parser
 
 
@@ -103,3 +118,21 @@ def main() -> None:
             f"saved={args.output} name={info.name} "
             f"seconds={info.source_seconds:.1f} dims={info.embedding_size}"
         )
+        return
+
+    if args.command == "synthesize":
+        synthesizer = OnnxSynthesizer(
+            Path(args.model),
+            sample_rate=args.sample_rate,
+        )
+        pipeline = VoiceCloningPipeline(
+            synthesizer=synthesizer,
+            vocabulary=PhonemeVocabulary.load(Path(args.vocab)),
+            phonemizer=EspeakPhonemizer(executable=args.espeak),
+        )
+        output = pipeline.synthesize_to_file(
+            args.text,
+            Path(args.voice),
+            Path(args.output),
+        )
+        print(output)
