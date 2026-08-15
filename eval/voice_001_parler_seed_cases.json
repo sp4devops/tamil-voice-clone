@@ -1,0 +1,35 @@
+{
+  "description": "A mature Indian male speaker with a calm, confident, conversational delivery, moderate-low pitch, natural pauses, clear articulation, and moderate speaking speed. The recording is studio quality, close-miked, dry, and has no background noise or reverberation.",
+  "cases": [
+    {
+      "id": "01_tamil",
+      "segments": [
+        {"language": "ta", "text": "தோழர்களே, இன்று நம்முடைய சர்வரில் ஏற்பட்ட பிரச்சினையை அமைதியாகவும் தெளிவாகவும் ஆய்வு செய்வோம். முதலில் பயன்பாட்டு பதிவுகள், தரவுத்தள இணைப்புகள், நினைவக பயன்பாடு மற்றும் வலைப்பின்னல் விதிகளை ஒவ்வொன்றாகச் சரிபார்க்க வேண்டும்."}
+      ]
+    },
+    {
+      "id": "02_english",
+      "segments": [
+        {"language": "en", "text": "Today we will inspect the production server carefully. First check the application logs, database connections, memory usage, and network policies before making any changes."}
+      ]
+    },
+    {
+      "id": "03_tanglish",
+      "segments": [
+        {"language": "ta", "text": "தோழர்களே, இன்று"},
+        {"language": "en", "text": "production server"},
+        {"language": "ta", "text": "ரொம்ப மெதுவாக இருக்கு. அதனால்"},
+        {"language": "en", "text": "application logs, database connections, memory usage, and network policies"},
+        {"language": "ta", "text": "எல்லாத்தையும் கவனமாகச் சரிபார்க்க வேண்டும்."}
+      ]
+    },
+    {
+      "id": "04_long_narration",
+      "segments": [
+        {"language": "ta", "text": "ஒரு பெரிய கணினி அமைப்பில் பிரச்சினை ஏற்பட்டால் உடனடியாக ஒரு முடிவுக்கு வரக்கூடாது. முதலில் அந்த நேரத்தில் என்ன மாற்றம் நடந்தது என்பதைப் பார்க்க வேண்டும். பிறகு செயலியின் பதிவுகள், சேவைகளின் நிலை, நினைவக பயன்பாடு, வட்டு இடம் மற்றும் தரவுத்தளத்தின் மெதுவான கேள்விகளை ஆய்வு செய்ய வேண்டும்."},
+        {"language": "en", "text": "A good investigation moves from symptoms to evidence and then to the root cause. Every change should be measured, documented, and reversible."},
+        {"language": "ta", "text": "இப்படி ஒழுங்காகச் செயல்பட்டால் தவறான மாற்றங்களைத் தவிர்த்து, உண்மையான காரணத்தை விரைவாகக் கண்டுபிடிக்க முடியும்."}
+      ]
+    }
+  ]
+}
