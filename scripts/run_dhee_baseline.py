@@ -40,12 +40,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def prepare_compatible_snapshot(model_id: str, compat_model_id: str, token: str | None) -> Path:
-    """Repair model metadata while preserving the requested Dhee weights.
-
-    Dhee-Indic-F5 currently publishes weights with an incomplete Transformers
-    config. The architecture is unchanged from IndicF5, so copy the public
-    IndicF5 remote-code loader and inject the standard INF5 config locally.
-    """
+    """Repair Dhee metadata while retaining its weights and IndicF5 vocabulary."""
 
     snapshot = Path(
         snapshot_download(
@@ -66,13 +61,35 @@ def prepare_compatible_snapshot(model_id: str, compat_model_id: str, token: str 
             token=token,
         )
     )
-    local_model_py = snapshot / "model.py"
-    shutil.copyfile(model_py, local_model_py)
+    vocab_file = Path(
+        hf_hub_download(
+            repo_id=compat_model_id,
+            filename="checkpoints/vocab.txt",
+            token=token,
+        )
+    )
 
-    # The upstream loader downloads weights/vocabulary through name_or_path.
-    # A local repaired snapshot changes name_or_path to a filesystem path, so
-    # force those asset lookups back to the requested Dhee repository.
+    local_model_py = snapshot / "model.py"
+    local_vocab_path = snapshot / "checkpoints" / "vocab.txt"
+    local_vocab_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(model_py, local_model_py)
+    shutil.copyfile(vocab_file, local_vocab_path)
+
+    # The Dhee repository contains the fine-tuned safetensors weights but does
+    # not publish checkpoints/vocab.txt. Replace only the vocabulary download
+    # with the compatible local IndicF5 vocabulary, then preserve any remaining
+    # upstream asset lookups against the requested Dhee repository.
     source = local_model_py.read_text(encoding="utf-8")
+    vocab_lookup = (
+        'vocab_path = hf_hub_download(config.name_or_path, '
+        'filename="checkpoints/vocab.txt")'
+    )
+    if vocab_lookup not in source:
+        raise RuntimeError("IndicF5 compatibility loader vocabulary lookup changed")
+    source = source.replace(
+        vocab_lookup,
+        'vocab_path = os.environ["INDICF5_VOCAB_PATH"]',
+    )
     source = source.replace(
         "hf_hub_download(config.name_or_path,",
         "hf_hub_download(os.environ.get('INDICF5_WEIGHTS_REPO', config.name_or_path),",
@@ -84,6 +101,7 @@ def prepare_compatible_snapshot(model_id: str, compat_model_id: str, token: str 
         encoding="utf-8",
     )
     os.environ["INDICF5_WEIGHTS_REPO"] = model_id
+    os.environ["INDICF5_VOCAB_PATH"] = str(local_vocab_path.resolve())
     return snapshot
 
 
