@@ -4,6 +4,7 @@ from pathlib import Path
 from .assets import CAMPPLUS_VOXCELEB, download_asset
 from .audio import inspect_reference
 from .cache import save_voice_cache
+from .phonemes import EspeakPhonemizer, split_language_spans, tagged_phoneme_text
 from .speaker import SherpaOnnxSpeakerEncoder, SpeakerEncoderConfig
 from .text import normalize_text
 
@@ -17,6 +18,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     normalize_cmd = sub.add_parser("normalize", help="Normalize Tamil/English/Tanglish text")
     normalize_cmd.add_argument("text")
+
+    spans_cmd = sub.add_parser(
+        "language-spans",
+        help="Show Tamil/English spans before phonemization",
+    )
+    spans_cmd.add_argument("text")
+
+    phonemize_cmd = sub.add_parser(
+        "phonemize",
+        help="Convert Tamil/English/Tanglish text to language-tagged IPA with eSpeak-NG",
+    )
+    phonemize_cmd.add_argument("text")
+    phonemize_cmd.add_argument("--espeak", default="espeak-ng")
 
     download_cmd = sub.add_parser(
         "download-speaker-model",
@@ -54,6 +68,19 @@ def main() -> None:
             f"tamil={profile.has_tamil} latin={profile.has_latin} "
             f"code_mixed={profile.is_code_mixed}"
         )
+        return
+
+    if args.command == "language-spans":
+        for span in split_language_spans(args.text):
+            print(f"{span.language}\t{span.text}")
+        return
+
+    if args.command == "phonemize":
+        phonemizer = EspeakPhonemizer(executable=args.espeak)
+        spans = phonemizer.phonemize(args.text)
+        for span in spans:
+            print(f"{span.language}\t{span.source_text}\t{span.ipa}")
+        print(tagged_phoneme_text(spans))
         return
 
     if args.command == "download-speaker-model":
