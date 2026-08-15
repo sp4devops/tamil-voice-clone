@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import pairwise
 
 import numpy as np
 
@@ -43,7 +44,7 @@ class CloneMetrics:
         values = self.window_similarities
         if len(values) < 2:
             return 0.0
-        return max(abs(current - previous) for previous, current in zip(values, values[1:]))
+        return max(abs(current - previous) for previous, current in pairwise(values))
 
 
 @dataclass(frozen=True)
