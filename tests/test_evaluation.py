@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from tamil_voice_clone.evaluation import (
     AcceptanceThresholds,
@@ -10,7 +11,7 @@ from tamil_voice_clone.evaluation import (
 
 def test_cosine_similarity_identical_vectors() -> None:
     vector = np.array([1.0, 2.0, 3.0], dtype=np.float32)
-    assert cosine_similarity(vector, vector) == 1.0
+    assert cosine_similarity(vector, vector) == pytest.approx(1.0, abs=1e-6)
 
 
 def test_accepts_metrics_that_clear_every_gate() -> None:
