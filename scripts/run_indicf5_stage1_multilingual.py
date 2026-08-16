@@ -188,6 +188,14 @@ def generate_candidate(
         "signal_metrics": signal,
         "verification": verification,
     }
+    print(
+        "stage1_candidate_metrics="
+        + json.dumps(
+            {"target": target_name, **metrics},
+            ensure_ascii=True,
+            sort_keys=True,
+        )
+    )
     return candidate, metrics
 
 
