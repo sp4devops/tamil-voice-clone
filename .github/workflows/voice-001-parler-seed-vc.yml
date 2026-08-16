@@ -21,8 +21,12 @@ jobs:
     timeout-minutes: 340
     env:
       REVIEWED_CODE_SHA: a0414b927782ba97393277ed41dd7c9814f8bbbf
-      REFERENCE_ASSET_SHA: 606d307dadefb79e8230e6907e528d2dea95c36b
-      REFERENCE_CIPHERTEXT_SHA256: d5504251700040d5d1c065f561bd2986074526906f50b860301ac91db15a7603
+      REFERENCE_VIDEO_URL: https://www.youtube.com/watch?v=tY_3TiehDFU
+      REFERENCE_VIDEO_ID: tY_3TiehDFU
+      REFERENCE_START: '00:07:00'
+      REFERENCE_DURATION_SECONDS: '40'
+      YT_DLP_VERSION: '2026.07.04'
+      YT_DLP_SHA256: 495be29ff4d9d4e9be7eabdfef225221e5d5282e77f2f505abc6dca80349f3fd
       SEED_VC_SHA: 51383efd921027683c89e5348211d93ff12ac2a8
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
       HUGGING_FACE_HUB_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -70,28 +74,49 @@ jobs:
           set -euo pipefail
           test -n "$HF_TOKEN"
           test -n "$VOICE_001_KEY"
-          test -n "$REFERENCE_ASSET_SHA"
-          test -n "$REFERENCE_CIPHERTEXT_SHA256"
+          test -n "$REFERENCE_VIDEO_URL"
+          test -n "$REFERENCE_VIDEO_ID"
+          test -n "$REFERENCE_START"
+          test -n "$REFERENCE_DURATION_SECONDS"
+          test -n "$YT_DLP_VERSION"
+          test -n "$YT_DLP_SHA256"
 
-      - name: Restore and validate full private reference
+      - name: Download and validate YouTube voice reference
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p data/private outputs/reports
+          mkdir -p data/private outputs/reports tools
           curl --fail --silent --show-error --location \
-            "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${REFERENCE_ASSET_SHA}/encrypted-assets/voice_001_ref.opus.enc.b64" \
-            --output data/private/voice_001_ref.opus.enc.b64
-          base64 --decode data/private/voice_001_ref.opus.enc.b64 \
-            > data/private/voice_001_ref.opus.enc
-          printf '%s  %s\n' "$REFERENCE_CIPHERTEXT_SHA256" \
-            data/private/voice_001_ref.opus.enc | sha256sum --check --strict
-          openssl enc -d -aes-256-cbc -pbkdf2 -iter 250000 \
-            -in data/private/voice_001_ref.opus.enc \
-            -out data/private/voice_001_ref.opus \
-            -pass env:VOICE_001_KEY
+            "https://github.com/yt-dlp/yt-dlp/releases/download/${YT_DLP_VERSION}/yt-dlp" \
+            --output tools/yt-dlp
+          printf '%s  %s\n' "$YT_DLP_SHA256" tools/yt-dlp \
+            | sha256sum --check --strict
+          chmod 0700 tools/yt-dlp
+          tools/yt-dlp --version
+
+          actual_video_id="$(tools/yt-dlp \
+            --no-playlist \
+            --skip-download \
+            --print id \
+            "$REFERENCE_VIDEO_URL")"
+          test "$actual_video_id" = "$REFERENCE_VIDEO_ID"
+
+          tools/yt-dlp \
+            --no-playlist \
+            --format 'bestaudio/best' \
+            --output 'data/private/reference_source.%(ext)s' \
+            "$REFERENCE_VIDEO_URL"
+          source_path="$(find data/private -maxdepth 1 -type f \
+            -name 'reference_source.*' ! -name '*.part' -print -quit)"
+          test -n "$source_path"
+
           ffmpeg -y -hide_banner -loglevel error \
-            -i data/private/voice_001_ref.opus \
-            -ac 1 -ar 24000 -c:a pcm_s24le data/private/voice_001_ref.wav
+            -ss "$REFERENCE_START" \
+            -i "$source_path" \
+            -t "$REFERENCE_DURATION_SECONDS" \
+            -vn -ac 1 -ar 24000 -c:a pcm_s24le \
+            data/private/voice_001_ref.wav
+          rm -f "$source_path" tools/yt-dlp
           ffprobe -v error \
             -show_entries stream=sample_rate,channels:format=duration \
             -of json data/private/voice_001_ref.wav \
@@ -103,10 +128,11 @@ jobs:
           info = json.loads(Path('outputs/reports/reference_info.json').read_text())
           duration = float(info['format']['duration'])
           stream = info['streams'][0]
-          if not 20.0 <= duration <= 40.0:
+          expected = float(__import__('os').environ['REFERENCE_DURATION_SECONDS'])
+          if not expected - 1.0 <= duration <= expected + 1.0:
               raise SystemExit(
-                  f'Reference duration is {duration:.2f}s; this reviewed quality run '
-                  'requires the full 20–40 second recording.'
+                  f'Reference duration is {duration:.2f}s; expected about {expected:.0f}s '
+                  'from YouTube timestamp 07:00–07:40.'
               )
           if int(stream['channels']) != 1 or int(stream['sample_rate']) != 24000:
               raise SystemExit(f'Unexpected normalized reference format: {stream}')
@@ -133,6 +159,8 @@ jobs:
           .venv-parler/bin/pip install --no-deps \
             'git+https://github.com/huggingface/parler-tts.git@d108732cd57788ec86bc857d99a6cabd66663d68'
           .venv-parler/bin/pip install 'descript-audio-codec==1.0.0'
+          # DAC's legacy audiotools metadata downgrades core packages. Restore
+          # the reviewed runtime versions inside this isolated environment.
           .venv-parler/bin/pip install --upgrade --force-reinstall \
             'numpy==1.26.4' 'transformers==4.46.1' 'protobuf==5.29.6'
           .venv-parler/bin/python - <<'PY'
@@ -388,7 +416,7 @@ jobs:
         with:
           name: voice-001-parler-seed-vc-encrypted
           path: |
-            outputs/voice_001_parler_seed_vc.tar.gz.enc
-            outputs/voice_001_parler_seed_vc.tar.gz.enc.sha256
+            outputs/voice_001_parler-seed-vc.tar.gz.enc
+            outputs/voice_001_parler-seed-vc.tar.gz.enc.sha256
           if-no-files-found: error
           retention-days: 1
