@@ -6,6 +6,8 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/voice-001-stage1-apple-silicon.yml'
+      - 'scripts/prepare_stage1_reference_text.py'
+      - 'scripts/run_indicf5_stage1_runtime_benchmark.py'
       - 'scripts/run_indicf5_stage1_multilingual.py'
       - 'scripts/run_indicf5_diagnostic.py'
       - 'scripts/run_dhee_baseline.py'
@@ -19,9 +21,9 @@ permissions:
   contents: read
 
 jobs:
-  validate-apple-silicon:
+  validate-apple-silicon-runtime:
     runs-on: macos-14
-    timeout-minutes: 120
+    timeout-minutes: 90
     env:
       VOICE_001_KEY: ${{ secrets.VOICE_001_KEY }}
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -46,8 +48,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          arch
           test "$(arch)" = 'arm64'
+          printf 'runner_arch=%s\n' "$(arch)"
           printf 'runner_memory_bytes=%s\n' "$(sysctl -n hw.memsize)"
           sw_vers
 
@@ -96,7 +98,7 @@ jobs:
           set -euo pipefail
           test -n "$VOICE_001_KEY"
           test -n "$HF_TOKEN"
-          mkdir -p data/private outputs/stage1_apple_silicon
+          mkdir -p data/private outputs/stage1_apple_silicon_runtime
 
           cat .github/reference/voice_001_ref_exact_4s.opus.enc.b64.part* \
             | base64 -D > data/private/reference.opus.enc
@@ -118,22 +120,27 @@ jobs:
             -ac 1 -ar 24000 -c:a pcm_s16le \
             data/private/reference.wav
 
-      - name: Run Stage 1 gate and measure peak RSS
+      - name: Prepare private aligned reference text
         shell: bash
         run: |
           set -euo pipefail
-          set +e
-          /usr/bin/time -l python scripts/run_indicf5_stage1_multilingual.py \
+          python scripts/prepare_stage1_reference_text.py \
             --reference data/private/reference.wav \
             --reference-text-file data/private/reference.txt \
-            --output-dir outputs/stage1_apple_silicon \
-            2> >(tee outputs/stage1_apple_silicon/resource_usage.txt >&2)
-          status=$?
-          set -e
-          printf 'benchmark_exit_status=%s\n' "$status"
-          exit "$status"
+            --output-file data/private/effective_reference.txt
+          test -s data/private/effective_reference.txt
 
-      - name: Build Apple Silicon benchmark report
+      - name: Measure TTS-only Stage 1 runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/time -l python scripts/run_indicf5_stage1_runtime_benchmark.py \
+            --reference data/private/reference.wav \
+            --effective-reference-text-file data/private/effective_reference.txt \
+            --output-dir outputs/stage1_apple_silicon_runtime \
+            2> >(tee outputs/stage1_apple_silicon_runtime/resource_usage.txt >&2)
+
+      - name: Build TTS-only Apple Silicon benchmark report
         shell: bash
         run: |
           set -euo pipefail
@@ -144,8 +151,8 @@ jobs:
           import subprocess
           from pathlib import Path
 
-          output_dir = Path('outputs/stage1_apple_silicon')
-          report = json.loads((output_dir / 'report.json').read_text(encoding='utf-8'))
+          output_dir = Path('outputs/stage1_apple_silicon_runtime')
+          runtime = json.loads((output_dir / 'runtime_report.json').read_text(encoding='utf-8'))
           usage = (output_dir / 'resource_usage.txt').read_text(encoding='utf-8', errors='replace')
           match = re.search(r'(?m)^\s*(\d+)\s+maximum resident set size\s*$', usage)
           if not match:
@@ -153,73 +160,70 @@ jobs:
 
           max_rss_bytes = int(match.group(1))
           physical_memory_bytes = int(subprocess.check_output(['sysctl', '-n', 'hw.memsize'], text=True).strip())
-          targets = report['targets']
-
-          selected = {}
-          for target_name in ('english', 'mixed'):
-              target = targets[target_name]
-              seed = int(target['selected_seed'])
-              metrics = next(item for item in target['candidate_metrics'] if int(item['seed']) == seed)
-              duration = float(metrics['verification']['duration_seconds'])
-              generation = float(metrics['generation_seconds'])
-              selected[target_name] = {
-                  'seed': seed,
-                  'duration_seconds': duration,
-                  'generation_seconds': generation,
-                  'real_time_factor': round(generation / duration, 3) if duration else None,
-                  'verification': metrics['verification'],
-              }
-
+          hard_ceiling_bytes = 2 * 1024 ** 3
           benchmark = {
-              'status': 'PASS',
+              'status': 'PASS' if max_rss_bytes <= hard_ceiling_bytes else 'MEMORY_CEILING_EXCEEDED',
               'runner': 'macos-14',
               'architecture': platform.machine(),
+              'measurement_scope': 'TTS_ONLY_PROCESS_NO_WHISPER_MODEL',
               'physical_memory_bytes': physical_memory_bytes,
               'physical_memory_gib': round(physical_memory_bytes / (1024 ** 3), 3),
               'maximum_resident_set_bytes': max_rss_bytes,
               'maximum_resident_set_gib': round(max_rss_bytes / (1024 ** 3), 3),
-              'peak_rss_percent_of_physical_memory': round(max_rss_bytes / physical_memory_bytes * 100, 2),
-              'fits_runner_memory': max_rss_bytes < physical_memory_bytes,
-              'model_id': report['model_id'],
-              'model_load_seconds': report['model_load_seconds'],
-              'english_two_seed_gate_passed': bool(targets['english']['two_seed_gate_passed']),
-              'mixed_two_seed_gate_passed': bool(targets['mixed']['two_seed_gate_passed']),
-              'selected_targets': selected,
-              'note': 'Peak RSS includes the strict Whisper verifier plus synthesis, so it is a conservative upper bound for TTS-only runtime memory.',
+              'hard_memory_ceiling_bytes': hard_ceiling_bytes,
+              'hard_memory_ceiling_gib': 2.0,
+              'meets_hard_2gib_ceiling': max_rss_bytes <= hard_ceiling_bytes,
+              'model_id': runtime['model_id'],
+              'model_load_seconds': runtime['model_load_seconds'],
+              'effective_weights_verified': runtime['effective_weights_verified'],
+              'targets': runtime['targets'],
           }
           if platform.machine() != 'arm64':
               raise SystemExit('Apple Silicon benchmark did not run on arm64')
-          if not benchmark['fits_runner_memory']:
-              raise SystemExit('Stage 1 exceeded physical memory on the standard Apple Silicon runner')
-
-          (output_dir / 'apple_silicon_benchmark.json').write_text(
+          (output_dir / 'apple_silicon_runtime_benchmark.json').write_text(
               json.dumps(benchmark, ensure_ascii=False, indent=2), encoding='utf-8'
           )
-          print('apple_silicon_benchmark=' + json.dumps(benchmark, ensure_ascii=True, sort_keys=True))
+          print('tts_only_peak_rss_gib=' + str(benchmark['maximum_resident_set_gib']))
+          print('meets_hard_2gib_ceiling=' + str(benchmark['meets_hard_2gib_ceiling']).lower())
           PY
 
       - name: Validate safe benchmark outputs
         shell: bash
         run: |
           set -euo pipefail
-          test -s outputs/stage1_apple_silicon/apple_silicon_benchmark.json
-          test -s outputs/stage1_apple_silicon/report.json
+          test -s outputs/stage1_apple_silicon_runtime/runtime_report.json
+          test -s outputs/stage1_apple_silicon_runtime/apple_silicon_runtime_benchmark.json
 
-      - name: Remove protected reference material and transient audio
+      - name: Remove protected and transient material
         if: always()
         shell: bash
         run: |
           rm -rf data/private
-          rm -f outputs/stage1_apple_silicon/*.wav
-          rm -f outputs/stage1_apple_silicon/resource_usage.txt
+          rm -f outputs/stage1_apple_silicon_runtime/*.wav
+          rm -f outputs/stage1_apple_silicon_runtime/resource_usage.txt
 
-      - name: Upload safe Apple Silicon benchmark
-        if: success()
+      - name: Upload safe TTS-only Apple Silicon benchmark
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: voice-001-stage1-apple-silicon-benchmark
+          name: voice-001-stage1-apple-silicon-runtime-benchmark
           path: |
-            outputs/stage1_apple_silicon/apple_silicon_benchmark.json
-            outputs/stage1_apple_silicon/report.json
-          if-no-files-found: error
+            outputs/stage1_apple_silicon_runtime/runtime_report.json
+            outputs/stage1_apple_silicon_runtime/apple_silicon_runtime_benchmark.json
+          if-no-files-found: warn
           retention-days: 7
+
+      - name: Enforce hard 2 GiB Stage 1 runtime ceiling
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          report = json.loads(Path('outputs/stage1_apple_silicon_runtime/apple_silicon_runtime_benchmark.json').read_text(encoding='utf-8'))
+          if not report['meets_hard_2gib_ceiling']:
+              raise SystemExit(
+                  f"TTS-only peak RSS {report['maximum_resident_set_gib']} GiB exceeds hard 2 GiB ceiling"
+              )
+          print('stage1_runtime_memory_gate=PASS')
+          PY
