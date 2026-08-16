@@ -100,7 +100,7 @@ def main() -> None:
         token=True,
         torch_dtype=torch.float32,
         low_cpu_mem_usage=True,
-        attn_implementation="sdpa",
+        attn_implementation="eager",
     ).to("cpu")
     model.eval()
     prompt_tokenizer = AutoTokenizer.from_pretrained(args.model_id, token=True)
@@ -119,7 +119,7 @@ def main() -> None:
         "frame_rate": round(frame_rate, 4),
         "seed": args.seed,
         "description": description,
-        "attention": "sdpa",
+        "attention": "eager",
         "cases": [],
     }
 
