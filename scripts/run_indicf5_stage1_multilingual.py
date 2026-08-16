@@ -39,9 +39,7 @@ TARGETS = {
     },
 }
 MIXED_SPANS = (
-    "வணக்கம்,",
-    "this is my voice.",
-    "இன்று",
+    "வணக்கம், this is my voice. இன்று",
     "Kubernetes",
     "சரியாக வேலை செய்கிறது.",
 )
