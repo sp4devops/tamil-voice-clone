@@ -16,8 +16,8 @@ permissions:
 
 jobs:
   synthesize:
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
     env:
       CACHE_KEY: voice-001-reference-tY_3TiehDFU-0700-40-v1
       VOICE_001_KEY: ${{ secrets.VOICE_001_KEY }}
@@ -38,7 +38,7 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install audio, transcription, and IndicF5 dependencies
+      - name: Install audio transcription and IndicF5 dependencies
         shell: bash
         run: |
           set -euo pipefail
@@ -65,6 +65,7 @@ jobs:
             cached_path click hydra-core jieba pypinyin tomli tqdm
           pip install --no-deps \
             git+https://github.com/AI4Bharat/IndicF5.git@13f7c4d627cc10111aea8fe9c0039462cacacdc7
+
           python - <<'PY'
           from pathlib import Path
           import f5_tts
@@ -105,37 +106,30 @@ jobs:
 
           ffmpeg -y -hide_banner -loglevel error \
             -i data/private/voice_001_ref_40s.wav \
-            -t 30 \
-            -ac 1 -ar 24000 -c:a pcm_s16le \
+            -t 30 -ac 1 -ar 24000 -c:a pcm_s16le \
             data/private/voice_001_ref_0700_0730.wav
           rm -f data/private/voice_001_ref_40s.wav
 
-          ffprobe -v error \
-            -show_entries stream=sample_rate,channels:format=duration \
-            -of json data/private/voice_001_ref_0700_0730.wav \
-            > data/private/reference_info.json
-          python - <<'PY'
-          import json
-          from pathlib import Path
-
-          info = json.loads(Path('data/private/reference_info.json').read_text())
-          duration = float(info['format']['duration'])
-          stream = info['streams'][0]
+          duration="$(ffprobe -v error -show_entries format=duration \
+            -of default=noprint_wrappers=1:nokey=1 \
+            data/private/voice_001_ref_0700_0730.wav)"
+          python - "$duration" <<'PY'
+          import sys
+          duration = float(sys.argv[1])
           if not 29.5 <= duration <= 30.5:
-              raise SystemExit(f'Unexpected reference duration: {duration:.3f}s')
-          if int(stream['channels']) != 1 or int(stream['sample_rate']) != 24000:
-              raise SystemExit(f'Unexpected reference format: {stream}')
+              raise SystemExit(f'Unexpected protected reference duration: {duration:.3f}s')
           print(f'Validated protected 07:00-07:30 window: {duration:.3f}s')
           PY
 
-      - name: Select clean short reference candidates
+      - name: Build exact word-aligned Tamil reference candidates
         shell: bash
         run: |
           set -euo pipefail
           python - <<'PY'
           import json
-          import math
           import re
+          import unicodedata
+          from difflib import SequenceMatcher
           from pathlib import Path
 
           import numpy as np
@@ -163,115 +157,172 @@ jobs:
               word_timestamps=True,
               temperature=0,
           )
-          segments = [
-              {
-                  'start': float(s.start),
-                  'end': float(s.end),
-                  'text': s.text.strip(),
-                  'avg_logprob': float(getattr(s, 'avg_logprob', -2.0)),
-                  'no_speech_prob': float(getattr(s, 'no_speech_prob', 1.0)),
-              }
-              for s in raw_segments
-              if s.text.strip()
-          ]
-          if not segments:
-              raise SystemExit('No Tamil speech segments found in protected reference')
 
           tamil_re = re.compile(r'[\u0B80-\u0BFF]')
-          letter_re = re.compile(r'[^\W\d_]', re.UNICODE)
 
-          def tamil_ratio(text: str) -> float:
-              letters = letter_re.findall(text)
-              if not letters:
+          def normalize_tamil(text: str) -> str:
+              return ''.join(ch for ch in text if tamil_re.match(ch))
+
+          def tamil_fraction(text: str) -> float:
+              letters_and_marks = [
+                  ch for ch in text
+                  if unicodedata.category(ch).startswith(('L', 'M'))
+              ]
+              if not letters_and_marks:
                   return 0.0
-              return sum(bool(tamil_re.match(ch)) for ch in letters) / len(letters)
+              value = sum(bool(tamil_re.match(ch)) for ch in letters_and_marks) / len(letters_and_marks)
+              return min(1.0, max(0.0, value))
 
-          candidates = []
-          for left in range(len(segments)):
-              for right in range(left, min(len(segments), left + 4)):
-                  group = segments[left:right + 1]
-                  if any(group[i + 1]['start'] - group[i]['end'] > 0.8 for i in range(len(group) - 1)):
-                      break
-                  start = group[0]['start']
-                  end = group[-1]['end']
-                  duration = end - start
-                  if duration > 9.5:
-                      break
-                  if duration < 4.0:
+          words = []
+          for segment in raw_segments:
+              segment_probability = max(0.0, min(1.0, 1.0 + float(getattr(segment, 'avg_logprob', -2.0))))
+              for word in segment.words or []:
+                  text = word.word.strip()
+                  start = float(word.start)
+                  end = float(word.end)
+                  probability = float(getattr(word, 'probability', segment_probability))
+                  if not text or end <= start:
                       continue
-                  text = ' '.join(item['text'] for item in group).strip()
-                  ratio = tamil_ratio(text)
-                  if not 18 <= len(text) <= 150 or ratio < 0.55:
+                  if not normalize_tamil(text):
                       continue
-                  avg_logprob = sum(item['avg_logprob'] for item in group) / len(group)
-                  no_speech = max(item['no_speech_prob'] for item in group)
-                  if no_speech > 0.35 or avg_logprob < -1.25:
-                      continue
-                  score = (
-                      avg_logprob
-                      + 1.5 * ratio
-                      - 0.12 * abs(duration - 6.5)
-                      - 1.5 * no_speech
-                  )
-                  candidates.append({
+                  words.append({
+                      'text': text,
                       'start': start,
                       'end': end,
+                      'probability': probability,
+                  })
+
+          if len(words) < 4:
+              raise SystemExit('Too few timestamped Tamil words found in the protected reference')
+
+          candidates = []
+          for left in range(len(words)):
+              group = []
+              for right in range(left, min(len(words), left + 12)):
+                  word = words[right]
+                  if group and word['start'] - group[-1]['end'] > 0.45:
+                      break
+                  group.append(word)
+                  duration = group[-1]['end'] - group[0]['start']
+                  if duration > 8.2:
+                      break
+                  if len(group) < 4 or duration < 3.2:
+                      continue
+
+                  transcript = ' '.join(item['text'] for item in group).strip()
+                  script_fraction = tamil_fraction(transcript)
+                  avg_probability = sum(item['probability'] for item in group) / len(group)
+                  min_probability = min(item['probability'] for item in group)
+                  if script_fraction < 0.88:
+                      continue
+                  if avg_probability < 0.55 or min_probability < 0.25:
+                      continue
+
+                  total_gap = sum(
+                      max(0.0, group[index + 1]['start'] - group[index]['end'])
+                      for index in range(len(group) - 1)
+                  )
+                  score = (
+                      2.0 * avg_probability
+                      + script_fraction
+                      - 0.10 * abs(duration - 5.5)
+                      - 0.25 * total_gap
+                  )
+                  candidates.append({
+                      'start': group[0]['start'],
+                      'end': group[-1]['end'],
                       'duration': duration,
-                      'text': text,
+                      'text': transcript,
                       'score': score,
-                      'tamil_ratio': ratio,
+                      'avg_probability': avg_probability,
+                      'tamil_fraction': script_fraction,
                   })
 
           candidates.sort(key=lambda item: item['score'], reverse=True)
           selected = []
           for candidate in candidates:
-              if any(
-                  max(0.0, min(candidate['end'], old['end']) - max(candidate['start'], old['start']))
-                  / min(candidate['duration'], old['duration']) > 0.7
-                  for old in selected
-              ):
+              overlap = False
+              for old in selected:
+                  overlap_seconds = max(
+                      0.0,
+                      min(candidate['end'], old['end']) - max(candidate['start'], old['start']),
+                  )
+                  if overlap_seconds / min(candidate['duration'], old['duration']) > 0.55:
+                      overlap = True
+                      break
+              if overlap:
                   continue
               selected.append(candidate)
-              if len(selected) == 3:
+              if len(selected) == 4:
                   break
 
           if not selected:
-              raise SystemExit('No sufficiently clean 4-9 second Tamil reference segment found')
+              raise SystemExit('No reliable word-aligned Tamil reference window was found')
 
-          fade_samples = int(sample_rate * 0.025)
-          public_metadata = []
+          created = []
+          fade_samples = int(sample_rate * 0.015)
           for index, candidate in enumerate(selected, start=1):
-              start_sample = max(0, int((candidate['start'] - 0.04) * sample_rate))
-              end_sample = min(len(audio), int((candidate['end'] + 0.04) * sample_rate))
+              start = max(0.0, candidate['start'] - 0.025)
+              end = min(len(audio) / sample_rate, candidate['end'] + 0.025)
+              start_sample = int(round(start * sample_rate))
+              end_sample = int(round(end * sample_rate))
               clip = audio[start_sample:end_sample].copy()
-              if len(clip) < int(3.8 * sample_rate):
+              if len(clip) < int(3.0 * sample_rate):
                   continue
-              fade = np.linspace(0.0, 1.0, fade_samples, dtype=np.float32)
-              clip[:fade_samples] *= fade
-              clip[-fade_samples:] *= fade[::-1]
-              clip /= max(1.0, float(np.max(np.abs(clip))) / 0.94)
-              sf.write(f'data/private/reference_candidate_{index}.wav', clip, sample_rate, subtype='PCM_16')
-              Path(f'data/private/reference_candidate_{index}.txt').write_text(
-                  candidate['text'], encoding='utf-8'
+
+              clip[:fade_samples] *= np.linspace(0.0, 1.0, fade_samples, dtype=np.float32)
+              clip[-fade_samples:] *= np.linspace(1.0, 0.0, fade_samples, dtype=np.float32)
+              peak = float(np.max(np.abs(clip)))
+              if peak > 0.98:
+                  clip *= 0.98 / peak
+
+              audio_path = Path(f'data/private/reference_candidate_{index}.wav')
+              text_path = Path(f'data/private/reference_candidate_{index}.txt')
+              sf.write(audio_path, clip, sample_rate, subtype='PCM_16')
+              text_path.write_text(candidate['text'], encoding='utf-8')
+
+              verify_segments, _ = whisper.transcribe(
+                  str(audio_path),
+                  language='ta',
+                  beam_size=5,
+                  vad_filter=False,
+                  condition_on_previous_text=False,
+                  temperature=0,
               )
-              public_metadata.append({
+              verified_text = ' '.join(
+                  segment.text.strip()
+                  for segment in verify_segments
+                  if segment.text.strip()
+              )
+              alignment_similarity = SequenceMatcher(
+                  None,
+                  normalize_tamil(candidate['text']),
+                  normalize_tamil(verified_text),
+              ).ratio()
+              if alignment_similarity < 0.78:
+                  audio_path.unlink(missing_ok=True)
+                  text_path.unlink(missing_ok=True)
+                  continue
+
+              created.append({
                   'id': index,
-                  'relative_start_seconds': round(candidate['start'], 3),
-                  'relative_end_seconds': round(candidate['end'], 3),
-                  'duration_seconds': round(candidate['duration'], 3),
-                  'tamil_ratio': round(candidate['tamil_ratio'], 3),
+                  'duration_seconds': round(len(clip) / sample_rate, 3),
+                  'word_alignment_similarity': round(alignment_similarity, 4),
+                  'average_word_probability': round(candidate['avg_probability'], 4),
+                  'tamil_fraction': round(candidate['tamil_fraction'], 4),
               })
 
-          if not public_metadata:
-              raise SystemExit('Candidate extraction produced no usable reference clips')
+          if not created:
+              raise SystemExit('Word-aligned reference clips failed transcript round-trip validation')
+
           Path('data/private/reference_candidates.json').write_text(
-              json.dumps({'count': len(public_metadata), 'candidates': public_metadata}, indent=2),
+              json.dumps({'count': len(created), 'candidates': created}, indent=2),
               encoding='utf-8',
           )
-          print(f'Selected {len(public_metadata)} protected short-reference candidates; transcripts not logged.')
+          print(f'Created {len(created)} exact word-aligned protected reference candidates.')
           PY
 
-      - name: Generate and automatically reject garbled candidates
+      - name: Generate candidates with strict beginning and full-sentence gates
         shell: bash
         run: |
           set -euo pipefail
@@ -281,17 +332,19 @@ jobs:
           import re
           import shutil
           import time
+          import unicodedata
           from difflib import SequenceMatcher
           from pathlib import Path
 
           import numpy as np
           import soundfile as sf
+          import torch
           from faster_whisper import WhisperModel
           from transformers import AutoModel
 
           from scripts.run_dhee_baseline import prepare_compatible_snapshot, validate_waveform
 
-          target_text = 'இது இயல்பான தெளிவான தமிழ் குரல் சோதனை.'
+          target_text = 'இது தெளிவான இயல்பான தமிழ் குரல்.'
           output_dir = Path('outputs/voice_001_indicf5_0700')
           output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -301,13 +354,13 @@ jobs:
               'AbhishekDelMundu/IndicF5',
               token,
           )
-          started = time.perf_counter()
+          model_started = time.perf_counter()
           model = AutoModel.from_pretrained(
               snapshot,
               trust_remote_code=True,
               local_files_only=True,
           )
-          model_load_seconds = time.perf_counter() - started
+          model_load_seconds = time.perf_counter() - model_started
 
           verifier = WhisperModel(
               'large-v3-turbo',
@@ -318,150 +371,211 @@ jobs:
           )
           tamil_re = re.compile(r'[\u0B80-\u0BFF]')
 
-          def normalize(text: str) -> str:
+          def normalize_tamil(text: str) -> str:
               return ''.join(ch for ch in text if tamil_re.match(ch))
 
-          target_normalized = normalize(target_text)
+          def tamil_fraction(text: str) -> float:
+              letters_and_marks = [
+                  ch for ch in text
+                  if unicodedata.category(ch).startswith(('L', 'M'))
+              ]
+              if not letters_and_marks:
+                  return 0.0
+              value = sum(bool(tamil_re.match(ch)) for ch in letters_and_marks) / len(letters_and_marks)
+              return min(1.0, max(0.0, value))
+
+          target_normalized = normalize_tamil(target_text)
+          prefix_length = max(8, int(len(target_normalized) * 0.55))
+          target_prefix = target_normalized[:prefix_length]
           attempts = []
           best = None
 
           for reference_path in sorted(Path('data/private').glob('reference_candidate_*.wav')):
-              candidate_id = reference_path.stem.rsplit('_', 1)[-1]
-              transcript_path = reference_path.with_suffix('.txt')
-              reference_text = transcript_path.read_text(encoding='utf-8').strip()
-              temp_output = Path(f'data/private/generated_candidate_{candidate_id}.wav')
-              try:
-                  case_started = time.perf_counter()
-                  generated = model(
-                      target_text,
-                      ref_audio_path=str(reference_path),
-                      ref_text=reference_text,
-                  )
-                  waveform = np.asarray(generated)
-                  if waveform.dtype == np.int16:
-                      waveform = waveform.astype(np.float32) / 32768.0
-                  waveform = waveform.astype(np.float32).reshape(-1)
-                  metrics = validate_waveform(waveform, f'candidate_{candidate_id}')
-                  duration = len(waveform) / 24000
-                  sf.write(temp_output, waveform, 24000, subtype='PCM_16')
+              candidate_id = int(reference_path.stem.rsplit('_', 1)[-1])
+              reference_text = reference_path.with_suffix('.txt').read_text(encoding='utf-8').strip()
 
-                  verify_segments, _ = verifier.transcribe(
-                      str(temp_output),
-                      language='ta',
-                      beam_size=5,
-                      vad_filter=True,
-                      condition_on_previous_text=False,
-                      temperature=0,
-                  )
-                  hypothesis = ' '.join(s.text.strip() for s in verify_segments if s.text.strip())
-                  hypothesis_normalized = normalize(hypothesis)
-                  similarity = SequenceMatcher(None, target_normalized, hypothesis_normalized).ratio()
-                  tamil_fraction = (
-                      len(hypothesis_normalized) / max(1, sum(ch.isalpha() for ch in hypothesis))
-                  )
-                  duration_ok = 2.0 <= duration <= 11.0
-                  intelligible = similarity >= 0.48 and tamil_fraction >= 0.55
-                  accepted = duration_ok and intelligible
-                  elapsed = time.perf_counter() - case_started
+              for seed in (11, 29, 47):
+                  output_path = Path(f'data/private/generated_candidate_{candidate_id}_seed_{seed}.wav')
+                  try:
+                      torch.manual_seed(seed)
+                      np.random.seed(seed)
+                      started = time.perf_counter()
+                      generated = model(
+                          target_text,
+                          ref_audio_path=str(reference_path),
+                          ref_text=reference_text,
+                      )
+                      waveform = np.asarray(generated)
+                      if waveform.dtype == np.int16:
+                          waveform = waveform.astype(np.float32) / 32768.0
+                      waveform = waveform.astype(np.float32).reshape(-1)
+                      signal_metrics = validate_waveform(
+                          waveform,
+                          f'candidate_{candidate_id}_seed_{seed}',
+                      )
+                      duration = len(waveform) / 24000
+                      sf.write(output_path, waveform, 24000, subtype='PCM_16')
 
-                  result = {
-                      'candidate_id': int(candidate_id),
-                      'duration_seconds': round(duration, 3),
-                      'generation_seconds': round(elapsed, 3),
-                      'asr_similarity': round(similarity, 4),
-                      'asr_tamil_fraction': round(tamil_fraction, 4),
-                      'duration_ok': duration_ok,
-                      'intelligible': intelligible,
-                      'accepted': accepted,
-                      **metrics,
-                  }
-                  attempts.append(result)
-                  print(
-                      f'Candidate {candidate_id}: duration={duration:.2f}s, '
-                      f'ASR similarity={similarity:.3f}, Tamil fraction={tamil_fraction:.3f}, '
-                      f'accepted={accepted}'
-                  )
+                      verify_segments, _ = verifier.transcribe(
+                          str(output_path),
+                          language='ta',
+                          beam_size=5,
+                          vad_filter=True,
+                          condition_on_previous_text=False,
+                          word_timestamps=True,
+                          temperature=0,
+                      )
+                      hypothesis = ' '.join(
+                          segment.text.strip()
+                          for segment in verify_segments
+                          if segment.text.strip()
+                      )
+                      hypothesis_normalized = normalize_tamil(hypothesis)
+                      overall_similarity = SequenceMatcher(
+                          None,
+                          target_normalized,
+                          hypothesis_normalized,
+                      ).ratio()
+                      hypothesis_prefix = hypothesis_normalized[:prefix_length]
+                      prefix_similarity = SequenceMatcher(
+                          None,
+                          target_prefix,
+                          hypothesis_prefix,
+                      ).ratio()
+                      script_fraction = tamil_fraction(hypothesis)
+                      length_ratio = len(hypothesis_normalized) / max(1, len(target_normalized))
+                      duration_ok = 2.0 <= duration <= 8.5
+                      length_ok = 0.78 <= length_ratio <= 1.30
+                      accepted = (
+                          duration_ok
+                          and length_ok
+                          and overall_similarity >= 0.86
+                          and prefix_similarity >= 0.82
+                          and script_fraction >= 0.90
+                      )
+                      elapsed = time.perf_counter() - started
 
-                  rank = similarity + 0.15 * tamil_fraction - 0.03 * abs(duration - 5.0)
-                  if accepted and (best is None or rank > best['rank']):
-                      best = {
-                          'rank': rank,
-                          'path': temp_output,
-                          'candidate_id': int(candidate_id),
-                          'result': result,
+                      result = {
+                          'candidate_id': candidate_id,
+                          'seed': seed,
+                          'duration_seconds': round(duration, 3),
+                          'generation_seconds': round(elapsed, 3),
+                          'overall_asr_similarity': round(overall_similarity, 4),
+                          'prefix_asr_similarity': round(prefix_similarity, 4),
+                          'tamil_fraction': round(script_fraction, 4),
+                          'normalized_length_ratio': round(length_ratio, 4),
+                          'duration_ok': duration_ok,
+                          'length_ok': length_ok,
+                          'accepted': accepted,
+                          **signal_metrics,
                       }
-              except Exception as exc:
-                  attempts.append({
-                      'candidate_id': int(candidate_id),
-                      'accepted': False,
-                      'error_type': type(exc).__name__,
-                  })
-                  print(f'Candidate {candidate_id} rejected with {type(exc).__name__}; details suppressed.')
+                      attempts.append(result)
+                      print(
+                          f'Candidate {candidate_id} seed {seed}: '
+                          f'overall={overall_similarity:.3f}, '
+                          f'prefix={prefix_similarity:.3f}, '
+                          f'tamil={script_fraction:.3f}, '
+                          f'length={length_ratio:.3f}, accepted={accepted}'
+                      )
 
+                      rank = (
+                          0.65 * overall_similarity
+                          + 0.30 * prefix_similarity
+                          + 0.05 * script_fraction
+                          - 0.02 * abs(duration - 4.5)
+                      )
+                      if accepted and (best is None or rank > best['rank']):
+                          best = {
+                              'rank': rank,
+                              'path': output_path,
+                              'result': result,
+                          }
+                  except Exception as exc:
+                      attempts.append({
+                          'candidate_id': candidate_id,
+                          'seed': seed,
+                          'accepted': False,
+                          'error_type': type(exc).__name__,
+                      })
+                      print(
+                          f'Candidate {candidate_id} seed {seed} rejected with '
+                          f'{type(exc).__name__}; details suppressed.'
+                      )
+
+          report_path = output_dir / 'strict_intelligibility_report.json'
           if best is None:
-              Path('outputs/voice_001_indicf5_0700/antigarble_report.json').write_text(
+              report_path.write_text(
                   json.dumps({
-                      'status': 'REJECTED_ALL_GARBLED_CANDIDATES',
+                      'status': 'REJECTED_NO_FULLY_INTELLIGIBLE_OUTPUT',
                       'model_load_seconds': model_load_seconds,
+                      'target_text': target_text,
+                      'thresholds': {
+                          'overall_asr_similarity': 0.86,
+                          'prefix_asr_similarity': 0.82,
+                          'tamil_fraction': 0.90,
+                          'length_ratio_min': 0.78,
+                          'length_ratio_max': 1.30,
+                      },
                       'attempts': attempts,
-                  }, indent=2),
+                  }, ensure_ascii=False, indent=2),
                   encoding='utf-8',
               )
-              raise SystemExit('All generated candidates failed duration/intelligibility gates; no audio will be uploaded')
+              raise SystemExit(
+                  'All outputs failed the strict beginning/full-sentence intelligibility gates; no audio uploaded'
+              )
 
-          final_path = output_dir / 'tamil_clone_0700_antigarble.wav'
+          final_path = output_dir / 'tamil_clone_0700_word_aligned.wav'
           shutil.copyfile(best['path'], final_path)
-          report = {
-              'status': 'PENDING_HUMAN_LISTENING_REVIEW',
-              'selected_candidate_id': best['candidate_id'],
-              'model_load_seconds': model_load_seconds,
-              'selected_metrics': best['result'],
-              'attempts': attempts,
-              'target_text': target_text,
-          }
-          (output_dir / 'antigarble_report.json').write_text(
-              json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8'
+          report_path.write_text(
+              json.dumps({
+                  'status': 'PENDING_HUMAN_LISTENING_REVIEW',
+                  'model_load_seconds': model_load_seconds,
+                  'target_text': target_text,
+                  'selected_metrics': best['result'],
+                  'attempts': attempts,
+              }, ensure_ascii=False, indent=2),
+              encoding='utf-8',
           )
-          print('Selected one candidate that passed automated duration and Tamil intelligibility gates.')
+          print('Selected one output that passed strict prefix and full-sentence checks.')
           PY
 
-      - name: Validate, encrypt, and remove private material
+      - name: Validate encrypt and remove private material
         shell: bash
         run: |
           set -euo pipefail
-          test -s outputs/voice_001_indicf5_0700/tamil_clone_0700_antigarble.wav
+          test -s outputs/voice_001_indicf5_0700/tamil_clone_0700_word_aligned.wav
           duration="$(ffprobe -v error -show_entries format=duration \
             -of default=noprint_wrappers=1:nokey=1 \
-            outputs/voice_001_indicf5_0700/tamil_clone_0700_antigarble.wav)"
+            outputs/voice_001_indicf5_0700/tamil_clone_0700_word_aligned.wav)"
           python - "$duration" <<'PY'
           import sys
           duration = float(sys.argv[1])
-          if not 2.0 <= duration <= 11.0:
+          if not 2.0 <= duration <= 8.5:
               raise SystemExit(f'Final duration gate failed: {duration:.3f}s')
-          print(f'Final anti-garble sample duration: {duration:.3f}s')
+          print(f'Final strict sample duration: {duration:.3f}s')
           PY
 
-          tar -czf outputs/voice_001_indicf5_0700_antigarble.tar.gz \
+          tar -czf outputs/voice_001_indicf5_0700_word_aligned.tar.gz \
             -C outputs voice_001_indicf5_0700
           openssl enc -aes-256-cbc -pbkdf2 -iter 250000 -salt \
-            -in outputs/voice_001_indicf5_0700_antigarble.tar.gz \
-            -out outputs/voice_001_indicf5_0700_antigarble.tar.gz.enc \
+            -in outputs/voice_001_indicf5_0700_word_aligned.tar.gz \
+            -out outputs/voice_001_indicf5_0700_word_aligned.tar.gz.enc \
             -pass env:VOICE_001_KEY
 
           rm -rf \
             data/private \
             outputs/voice_001_indicf5_0700 \
-            outputs/voice_001_indicf5_0700_antigarble.tar.gz
+            outputs/voice_001_indicf5_0700_word_aligned.tar.gz
 
       - name: Remove private material after failure
         if: failure()
         shell: bash
         run: rm -rf data/private outputs/voice_001_indicf5_0700
 
-      - name: Upload encrypted anti-garble Tamil gate only
+      - name: Upload encrypted strict Tamil gate only
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: voice-001-indicf5-0700-antigarble-encrypted
-          path: outputs/voice_001_indicf5_0700_antigarble.tar.gz.enc
+          name: voice-001-indicf5-0700-word-aligned-encrypted
+          path: outputs/voice_001_indicf5_0700_word_aligned.tar.gz.enc
           if-no-files-found: error
           retention-days: 1
