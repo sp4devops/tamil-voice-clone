@@ -1,0 +1,225 @@
+name: voice-001-stage1-apple-silicon
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/voice-001-stage1-apple-silicon.yml'
+      - 'scripts/run_indicf5_stage1_multilingual.py'
+      - 'scripts/run_indicf5_diagnostic.py'
+      - 'scripts/run_dhee_baseline.py'
+      - '.github/reference/voice_001_ref_exact_4s.*'
+
+concurrency:
+  group: voice-001-stage1-apple-silicon
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate-apple-silicon:
+    runs-on: macos-14
+    timeout-minutes: 120
+    env:
+      VOICE_001_KEY: ${{ secrets.VOICE_001_KEY }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_HOME: /Users/runner/.cache/huggingface
+      OMP_NUM_THREADS: '3'
+      MKL_NUM_THREADS: '3'
+      TOKENIZERS_PARALLELISM: 'false'
+      PYTORCH_ENABLE_MPS_FALLBACK: '1'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.10'
+
+      - name: Verify Apple Silicon runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          arch
+          test "$(arch)" = 'arm64'
+          printf 'runner_memory_bytes=%s\n' "$(sysctl -n hw.memsize)"
+          sw_vers
+
+      - name: Restore pip and model caches
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/Library/Caches/pip
+            ~/.cache/huggingface
+          key: voice-001-indicf5-${{ runner.os }}-${{ runner.arch }}-py310-v2
+          restore-keys: |
+            voice-001-indicf5-${{ runner.os }}-${{ runner.arch }}-py310-
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew list ffmpeg >/dev/null 2>&1 || brew install ffmpeg
+          brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
+          python -m pip install --upgrade pip
+          pip install 'torch==2.6.0' 'torchaudio==2.6.0'
+          pip install \
+            'transformers==4.49.0' 'accelerate==0.33.0' \
+            'numpy==1.26.4' 'soundfile>=0.12,<1' \
+            'huggingface-hub>=0.27,<1' 'safetensors>=0.4.5' \
+            'vocos==0.1.0' 'pydub==0.25.1' 'librosa>=0.10.2,<1' \
+            'matplotlib>=3.8,<4' 'torchdiffeq>=0.2.4' \
+            'ema-pytorch>=0.5.2' 'x-transformers>=1.31.14' \
+            'faster-whisper==1.2.0' \
+            cached_path click hydra-core jieba pypinyin tomli tqdm
+          pip install --no-deps \
+            git+https://github.com/AI4Bharat/IndicF5.git@13f7c4d627cc10111aea8fe9c0039462cacacdc7
+          python - <<'PY'
+          from pathlib import Path
+          import f5_tts
+          path = Path(f5_tts.__file__).parent / 'model' / '__init__.py'
+          text = path.read_text(encoding='utf-8')
+          text = text.replace('from f5_tts.model.trainer import Trainer\n', '')
+          text = text.replace(', "Trainer"', '')
+          path.write_text(text, encoding='utf-8')
+          PY
+
+      - name: Recover protected reference pair
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$VOICE_001_KEY"
+          test -n "$HF_TOKEN"
+          mkdir -p data/private outputs/stage1_apple_silicon
+
+          cat .github/reference/voice_001_ref_exact_4s.opus.enc.b64.part* \
+            | base64 -D > data/private/reference.opus.enc
+          base64 -D .github/reference/voice_001_ref_exact_4s.txt.enc.b64 \
+            > data/private/reference.txt.enc
+
+          OPENSSL_BIN="$(brew --prefix openssl@3)/bin/openssl"
+          "$OPENSSL_BIN" enc -d -aes-256-cbc -pbkdf2 -iter 250000 \
+            -in data/private/reference.opus.enc \
+            -out data/private/reference.opus \
+            -pass env:VOICE_001_KEY
+          "$OPENSSL_BIN" enc -d -aes-256-cbc -pbkdf2 -iter 250000 \
+            -in data/private/reference.txt.enc \
+            -out data/private/reference.txt \
+            -pass env:VOICE_001_KEY
+
+          ffmpeg -y -hide_banner -loglevel error \
+            -i data/private/reference.opus \
+            -ac 1 -ar 24000 -c:a pcm_s16le \
+            data/private/reference.wav
+
+      - name: Run Stage 1 gate and measure peak RSS
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          /usr/bin/time -l python scripts/run_indicf5_stage1_multilingual.py \
+            --reference data/private/reference.wav \
+            --reference-text-file data/private/reference.txt \
+            --output-dir outputs/stage1_apple_silicon \
+            2> >(tee outputs/stage1_apple_silicon/resource_usage.txt >&2)
+          status=$?
+          set -e
+          printf 'benchmark_exit_status=%s\n' "$status"
+          exit "$status"
+
+      - name: Build Apple Silicon benchmark report
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import platform
+          import re
+          import subprocess
+          from pathlib import Path
+
+          output_dir = Path('outputs/stage1_apple_silicon')
+          report = json.loads((output_dir / 'report.json').read_text(encoding='utf-8'))
+          usage = (output_dir / 'resource_usage.txt').read_text(encoding='utf-8', errors='replace')
+          match = re.search(r'(?m)^\s*(\d+)\s+maximum resident set size\s*$', usage)
+          if not match:
+              raise SystemExit('Could not parse macOS maximum resident set size')
+
+          max_rss_bytes = int(match.group(1))
+          physical_memory_bytes = int(subprocess.check_output(['sysctl', '-n', 'hw.memsize'], text=True).strip())
+          targets = report['targets']
+
+          selected = {}
+          for target_name in ('english', 'mixed'):
+              target = targets[target_name]
+              seed = int(target['selected_seed'])
+              metrics = next(item for item in target['candidate_metrics'] if int(item['seed']) == seed)
+              duration = float(metrics['verification']['duration_seconds'])
+              generation = float(metrics['generation_seconds'])
+              selected[target_name] = {
+                  'seed': seed,
+                  'duration_seconds': duration,
+                  'generation_seconds': generation,
+                  'real_time_factor': round(generation / duration, 3) if duration else None,
+                  'verification': metrics['verification'],
+              }
+
+          benchmark = {
+              'status': 'PASS',
+              'runner': 'macos-14',
+              'architecture': platform.machine(),
+              'physical_memory_bytes': physical_memory_bytes,
+              'physical_memory_gib': round(physical_memory_bytes / (1024 ** 3), 3),
+              'maximum_resident_set_bytes': max_rss_bytes,
+              'maximum_resident_set_gib': round(max_rss_bytes / (1024 ** 3), 3),
+              'peak_rss_percent_of_physical_memory': round(max_rss_bytes / physical_memory_bytes * 100, 2),
+              'fits_runner_memory': max_rss_bytes < physical_memory_bytes,
+              'model_id': report['model_id'],
+              'model_load_seconds': report['model_load_seconds'],
+              'english_two_seed_gate_passed': bool(targets['english']['two_seed_gate_passed']),
+              'mixed_two_seed_gate_passed': bool(targets['mixed']['two_seed_gate_passed']),
+              'selected_targets': selected,
+              'note': 'Peak RSS includes the strict Whisper verifier plus synthesis, so it is a conservative upper bound for TTS-only runtime memory.',
+          }
+          if platform.machine() != 'arm64':
+              raise SystemExit('Apple Silicon benchmark did not run on arm64')
+          if not benchmark['fits_runner_memory']:
+              raise SystemExit('Stage 1 exceeded physical memory on the standard Apple Silicon runner')
+
+          (output_dir / 'apple_silicon_benchmark.json').write_text(
+              json.dumps(benchmark, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+          print('apple_silicon_benchmark=' + json.dumps(benchmark, ensure_ascii=True, sort_keys=True))
+          PY
+
+      - name: Validate safe benchmark outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s outputs/stage1_apple_silicon/apple_silicon_benchmark.json
+          test -s outputs/stage1_apple_silicon/report.json
+
+      - name: Remove protected reference material and transient audio
+        if: always()
+        shell: bash
+        run: |
+          rm -rf data/private
+          rm -f outputs/stage1_apple_silicon/*.wav
+          rm -f outputs/stage1_apple_silicon/resource_usage.txt
+
+      - name: Upload safe Apple Silicon benchmark
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: voice-001-stage1-apple-silicon-benchmark
+          path: |
+            outputs/stage1_apple_silicon/apple_silicon_benchmark.json
+            outputs/stage1_apple_silicon/report.json
+          if-no-files-found: error
+          retention-days: 7
