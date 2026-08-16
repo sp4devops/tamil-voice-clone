@@ -1,0 +1,96 @@
+name: voice-001-publish-listening-sample
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/voice-001-publish-listening-sample.yml'
+
+concurrency:
+  group: voice-001-publish-listening-sample
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      VOICE_001_KEY: ${{ secrets.VOICE_001_KEY }}
+      SOURCE_ARTIFACT_ID: '9268981622'
+
+    steps:
+      - name: Download approved encrypted diagnostic
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test -n "$VOICE_001_KEY"
+          mkdir -p secure/source secure/extracted publish
+          curl --fail --silent --show-error --location \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/${SOURCE_ARTIFACT_ID}/zip" \
+            -o secure/source/artifact.zip
+          test -s secure/source/artifact.zip
+          unzip -q secure/source/artifact.zip -d secure/source/unpacked
+          test -s secure/source/unpacked/voice_001_diagnostic.tar.gz.enc
+
+      - name: Decrypt approved bundle and extract generated WAV only
+        shell: bash
+        run: |
+          set -euo pipefail
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 250000 \
+            -in secure/source/unpacked/voice_001_diagnostic.tar.gz.enc \
+            -out secure/source/voice_001_diagnostic.tar.gz \
+            -pass env:VOICE_001_KEY
+
+          tar -xzf secure/source/voice_001_diagnostic.tar.gz -C secure/extracted
+          src='secure/extracted/voice_001_diagnostic/diagnostic_direct_short.wav'
+          test -s "$src"
+          cp "$src" publish/voice_001_listening_sample.wav
+
+      - name: Validate listening sample
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update >/dev/null
+          sudo apt-get install -y --no-install-recommends ffmpeg >/dev/null
+          wav='publish/voice_001_listening_sample.wav'
+          test -s "$wav"
+          codec="$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name \
+            -of default=noprint_wrappers=1:nokey=1 "$wav")"
+          duration="$(ffprobe -v error -show_entries format=duration \
+            -of default=noprint_wrappers=1:nokey=1 "$wav")"
+          python - "$codec" "$duration" <<'PY'
+          import sys
+          codec = sys.argv[1]
+          duration = float(sys.argv[2])
+          if codec != 'pcm_s16le':
+              raise SystemExit(f'Unexpected audio codec: {codec}')
+          if not 0.8 <= duration <= 5.0:
+              raise SystemExit(f'Unexpected listening-sample duration: {duration:.3f}s')
+          print(f'Validated generated listening sample: codec={codec}, duration={duration:.3f}s')
+          PY
+          sha256sum "$wav" | awk '{print "Listening sample SHA-256: "$1}'
+
+      - name: Remove decrypted bundle and temporary material
+        if: always()
+        shell: bash
+        run: |
+          rm -rf secure
+
+      - name: Upload generated listening sample
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: voice-001-listening-sample
+          path: publish/voice_001_listening_sample.wav
+          if-no-files-found: error
+          retention-days: 1
