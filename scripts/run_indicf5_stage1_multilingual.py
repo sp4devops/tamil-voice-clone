@@ -14,6 +14,7 @@ import numpy as np
 import soundfile as sf
 import torch
 from faster_whisper import WhisperModel
+from f5_tts.infer.utils_infer import infer_process, preprocess_ref_audio_text
 
 from run_dhee_baseline import prepare_compatible_snapshot, validate_waveform
 from run_indicf5_diagnostic import (
@@ -141,6 +142,75 @@ def verify_mixed(verifier: WhisperModel, path: Path, target: str) -> dict[str, o
     }
 
 
+def synthesize_with_unicode_duration(
+    *,
+    model,
+    reference: Path,
+    effective_ref_text: str,
+    target_text: str,
+) -> tuple[np.ndarray, dict[str, float]]:
+    """Use a script-neutral duration estimate for cross-script generation.
+
+    IndicF5's default duration heuristic compares UTF-8 byte lengths. Tamil
+    characters use multiple bytes while English characters are mostly one byte,
+    which can severely under-allocate duration for Tamil-reference -> English
+    synthesis. We preserve the official inference path and supply only its
+    supported fix_duration parameter, estimated from normalized Unicode length
+    and the actual reference speech rate.
+    """
+    captured = io.StringIO()
+    prepared_ref_audio: str | None = None
+    try:
+        with redirect_stdout(captured), redirect_stderr(captured):
+            prepared_ref_audio, prepared_ref_text = preprocess_ref_audio_text(
+                str(reference), effective_ref_text
+            )
+
+            if getattr(model, "_buffers_need_recompute", False):
+                model._recompute_buffers()
+            model.ema_model.to(model.device)
+            model.vocoder.to(model.device)
+
+            reference_seconds = float(sf.info(prepared_ref_audio).duration)
+            reference_chars = len(safe_normalize(effective_ref_text))
+            target_chars = len(safe_normalize(target_text))
+            if reference_chars < 1 or target_chars < 1:
+                raise RuntimeError("Cannot estimate multilingual duration from empty text")
+
+            requested_generated_seconds = reference_seconds * target_chars / reference_chars
+            requested_generated_seconds = min(8.0, max(2.5, requested_generated_seconds))
+            fix_duration_seconds = reference_seconds + requested_generated_seconds
+
+            audio, final_sample_rate, _ = infer_process(
+                prepared_ref_audio,
+                prepared_ref_text,
+                target_text,
+                model.ema_model,
+                model.vocoder,
+                mel_spec_type="vocos",
+                speed=model.config.speed,
+                fix_duration=fix_duration_seconds,
+                device=model.device,
+            )
+        if int(final_sample_rate) != SAMPLE_RATE:
+            raise RuntimeError("Unexpected IndicF5 sample rate")
+        return np.asarray(audio, dtype=np.float32).reshape(-1), {
+            "reference_seconds": round(reference_seconds, 3),
+            "requested_generated_seconds": round(requested_generated_seconds, 3),
+            "fix_duration_seconds": round(fix_duration_seconds, 3),
+            "reference_unicode_char_count": float(reference_chars),
+            "target_unicode_char_count": float(target_chars),
+        }
+    finally:
+        if prepared_ref_audio:
+            prepared = Path(prepared_ref_audio)
+            try:
+                if prepared.resolve() != reference.resolve():
+                    prepared.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 def generate_candidate(
     *,
     model,
@@ -155,24 +225,18 @@ def generate_candidate(
     torch.manual_seed(seed)
     np.random.seed(seed)
     started = time.perf_counter()
-    captured = io.StringIO()
     try:
-        with redirect_stdout(captured), redirect_stderr(captured):
-            generated = model(
-                target_text,
-                ref_audio_path=str(reference),
-                ref_text=effective_ref_text,
-            )
+        waveform, duration_plan = synthesize_with_unicode_duration(
+            model=model,
+            reference=reference,
+            effective_ref_text=effective_ref_text,
+            target_text=target_text,
+        )
     except Exception as exc:
         raise RuntimeError(
             f"IndicF5 {target_name} generation failed: {type(exc).__name__}"
         ) from None
     generation_seconds = time.perf_counter() - started
-
-    waveform = np.asarray(generated)
-    if waveform.dtype == np.int16:
-        waveform = waveform.astype(np.float32) / 32768.0
-    waveform = waveform.astype(np.float32).reshape(-1)
     signal = validate_waveform(waveform, f"stage1_{target_name}_seed_{seed}")
 
     candidate = output_dir / f".{target_name}_seed_{seed}.wav"
@@ -185,6 +249,7 @@ def generate_candidate(
     metrics: dict[str, object] = {
         "seed": seed,
         "generation_seconds": round(generation_seconds, 3),
+        "duration_plan": duration_plan,
         "signal_metrics": signal,
         "verification": verification,
     }
