@@ -23,7 +23,6 @@ jobs:
       START_SECONDS: '420'
       DURATION_SECONDS: '30'
       VOICE_001_KEY: ${{ secrets.VOICE_001_KEY }}
-      YOUTUBE_COOKIES_B64: ${{ secrets.YOUTUBE_COOKIES_B64 }}
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
       OMP_NUM_THREADS: '4'
       MKL_NUM_THREADS: '4'
@@ -40,12 +39,12 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install audio, transcription, and IndicF5 dependencies
+      - name: Install audio, transcription, proof-token, and IndicF5 dependencies
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y ffmpeg jq curl
+          sudo apt-get install -y ffmpeg git
           python -m pip install --upgrade pip
           pip install --index-url https://download.pytorch.org/whl/cpu \
             'torch==2.6.0' 'torchaudio==2.6.0'
@@ -64,10 +63,20 @@ jobs:
             'ema-pytorch>=0.5.2' \
             'x-transformers>=1.31.14' \
             'faster-whisper==1.2.0' \
-            'yt-dlp>=2026.8.1' \
+            'yt-dlp[default]>=2026.8.1' \
+            'bgutil-ytdlp-pot-provider==1.3.1' \
             cached_path click hydra-core jieba pypinyin tomli tqdm
           pip install --no-deps \
             git+https://github.com/AI4Bharat/IndicF5.git@13f7c4d627cc10111aea8fe9c0039462cacacdc7
+
+          git clone --depth 1 --branch 1.3.1 \
+            https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git \
+            /tmp/bgutil-ytdlp-pot-provider
+          pushd /tmp/bgutil-ytdlp-pot-provider/server
+          npm ci
+          npx tsc
+          popd
+
           python - <<'PY'
           from pathlib import Path
           import f5_tts
@@ -78,6 +87,9 @@ jobs:
           source = source.replace(', "Trainer"', '')
           model_init.write_text(source, encoding='utf-8')
           PY
+
+          yt-dlp --version
+          node --version
 
       - name: Validate encryption key
         shell: bash
@@ -91,42 +103,18 @@ jobs:
           set -euo pipefail
           mkdir -p data/private outputs/voice_001_indicf5_0700
 
-          downloaded=0
-          for api in \
-            https://api.piped.private.coffee \
-            https://pipedapi.wireway.ch \
-            https://pipedapi.leptons.xyz \
-            https://piped-api.privacy.com.de
-          do
-            echo "Trying public stream backend: $api"
-            if curl -fsSL --retry 2 --connect-timeout 15 \
-              "$api/streams/$VIDEO_ID" -o data/private/streams.json; then
-              audio_url="$(jq -r '
-                [.audioStreams[]? | select(.url != null and .url != "")]
-                | sort_by(.bitrate // 0) | reverse | .[0].url // empty
-              ' data/private/streams.json)"
-              if [ -n "$audio_url" ] && curl -fL --retry 3 --connect-timeout 20 \
-                -A 'Mozilla/5.0' "$audio_url" -o data/private/source_audio; then
-                downloaded=1
-                break
-              fi
-            fi
-          done
+          yt-dlp \
+            --remote-components ejs:github \
+            --js-runtimes node \
+            --extractor-args 'youtube:player_client=mweb' \
+            --extractor-args 'youtubepot-bgutilscript:server_home=/tmp/bgutil-ytdlp-pot-provider/server' \
+            --no-playlist \
+            --retries 5 \
+            --fragment-retries 5 \
+            -f 'bestaudio/best' \
+            -o data/private/source_audio \
+            "https://www.youtube.com/watch?v=$VIDEO_ID"
 
-          if [ "$downloaded" -ne 1 ] && [ -n "${YOUTUBE_COOKIES_B64:-}" ]; then
-            echo 'Public stream backends failed; trying protected yt-dlp fallback.'
-            printf '%s' "$YOUTUBE_COOKIES_B64" | base64 --decode > data/private/cookies.txt
-            yt-dlp \
-              --cookies data/private/cookies.txt \
-              --no-playlist \
-              --extractor-args 'youtube:player_client=web,android_vr' \
-              -f 'bestaudio/best' \
-              -o data/private/source_audio \
-              "https://www.youtube.com/watch?v=$VIDEO_ID"
-            downloaded=1
-          fi
-
-          test "$downloaded" -eq 1
           ffmpeg -y -hide_banner -loglevel error \
             -ss "$START_SECONDS" -t "$DURATION_SECONDS" \
             -i data/private/source_audio \
@@ -239,6 +227,11 @@ jobs:
             data/private \
             outputs/voice_001_indicf5_0700 \
             outputs/voice_001_indicf5_0700.tar.gz
+
+      - name: Remove private material after failure
+        if: failure()
+        shell: bash
+        run: rm -rf data/private outputs/voice_001_indicf5_0700
 
       - name: Upload encrypted Tamil gate only
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
