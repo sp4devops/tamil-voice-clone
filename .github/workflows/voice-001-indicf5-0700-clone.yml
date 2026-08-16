@@ -17,11 +17,8 @@ permissions:
 jobs:
   synthesize:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     env:
-      VIDEO_ID: tY_3TiehDFU
-      START_SECONDS: '420'
-      DURATION_SECONDS: '30'
       CACHE_KEY: voice-001-reference-tY_3TiehDFU-0700-40-v1
       VOICE_001_KEY: ${{ secrets.VOICE_001_KEY }}
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -88,14 +85,13 @@ jobs:
           test -n "$CACHE_KEY"
 
       - name: Restore encrypted 07:00 voice reference cache
-        id: reference-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: data/private/voice_001_ref.wav.enc
           key: ${{ env.CACHE_KEY }}
           fail-on-cache-miss: true
 
-      - name: Recover validated 07:00-07:30 reference
+      - name: Recover exact 07:00-07:30 source window
         shell: bash
         run: |
           set -euo pipefail
@@ -109,128 +105,363 @@ jobs:
 
           ffmpeg -y -hide_banner -loglevel error \
             -i data/private/voice_001_ref_40s.wav \
-            -t "$DURATION_SECONDS" \
-            -af 'highpass=f=60,lowpass=f=11000,loudnorm=I=-18:TP=-2:LRA=7' \
+            -t 30 \
             -ac 1 -ar 24000 -c:a pcm_s16le \
             data/private/voice_001_ref_0700_0730.wav
+          rm -f data/private/voice_001_ref_40s.wav
 
+          ffprobe -v error \
+            -show_entries stream=sample_rate,channels:format=duration \
+            -of json data/private/voice_001_ref_0700_0730.wav \
+            > data/private/reference_info.json
           python - <<'PY'
           import json
           from pathlib import Path
-          import soundfile as sf
 
-          path = Path('data/private/voice_001_ref_0700_0730.wav')
-          audio, rate = sf.read(path)
-          duration = len(audio) / rate
-          if rate != 24000:
-              raise SystemExit(f'Unexpected sample rate: {rate}')
-          if getattr(audio, 'ndim', 1) != 1:
-              raise SystemExit('Reference is not mono')
+          info = json.loads(Path('data/private/reference_info.json').read_text())
+          duration = float(info['format']['duration'])
+          stream = info['streams'][0]
           if not 29.5 <= duration <= 30.5:
               raise SystemExit(f'Unexpected reference duration: {duration:.3f}s')
-          if float(abs(audio).max()) < 0.02 or float(audio.std()) < 0.005:
-              raise SystemExit('Reference appears silent or unusable')
-
-          metadata = {
-              'video_id': 'tY_3TiehDFU',
-              'source_cache_key': 'voice-001-reference-tY_3TiehDFU-0700-40-v1',
-              'start_seconds': 420,
-              'end_seconds': 450,
-              'duration_seconds': duration,
-              'sample_rate': rate,
-              'channels': 1,
-          }
-          Path('outputs/voice_001_indicf5_0700/reference_metadata.json').write_text(
-              json.dumps(metadata, indent=2), encoding='utf-8'
-          )
-          print(f'Validated cached reference: {duration:.3f}s, mono, {rate} Hz')
+          if int(stream['channels']) != 1 or int(stream['sample_rate']) != 24000:
+              raise SystemExit(f'Unexpected reference format: {stream}')
+          print(f'Validated protected 07:00-07:30 window: {duration:.3f}s')
           PY
-          rm -f data/private/voice_001_ref_40s.wav
 
-      - name: Recover private reference transcript
+      - name: Select clean short reference candidates
         shell: bash
         run: |
           set -euo pipefail
           python - <<'PY'
+          import json
+          import math
+          import re
           from pathlib import Path
+
+          import numpy as np
+          import soundfile as sf
           from faster_whisper import WhisperModel
 
-          model = WhisperModel(
+          source_path = Path('data/private/voice_001_ref_0700_0730.wav')
+          audio, sample_rate = sf.read(source_path, dtype='float32')
+          if sample_rate != 24000 or audio.ndim != 1:
+              raise SystemExit('Unexpected protected source format')
+
+          whisper = WhisperModel(
               'large-v3-turbo',
               device='cpu',
               compute_type='int8',
               cpu_threads=4,
               num_workers=1,
           )
-          segments, info = model.transcribe(
-              'data/private/voice_001_ref_0700_0730.wav',
+          raw_segments, _ = whisper.transcribe(
+              str(source_path),
               language='ta',
               beam_size=5,
               vad_filter=True,
-              condition_on_previous_text=True,
+              condition_on_previous_text=False,
+              word_timestamps=True,
+              temperature=0,
           )
-          text = ' '.join(segment.text.strip() for segment in segments if segment.text.strip())
-          if len(text) < 20:
-              raise SystemExit('Recovered transcript is unexpectedly short')
-          Path('data/private/voice_001_ref_0700_0730.txt').write_text(text, encoding='utf-8')
-          print(f'Recovered private Tamil transcript ({len(text)} characters); content not logged.')
+          segments = [
+              {
+                  'start': float(s.start),
+                  'end': float(s.end),
+                  'text': s.text.strip(),
+                  'avg_logprob': float(getattr(s, 'avg_logprob', -2.0)),
+                  'no_speech_prob': float(getattr(s, 'no_speech_prob', 1.0)),
+              }
+              for s in raw_segments
+              if s.text.strip()
+          ]
+          if not segments:
+              raise SystemExit('No Tamil speech segments found in protected reference')
+
+          tamil_re = re.compile(r'[\u0B80-\u0BFF]')
+          letter_re = re.compile(r'[^\W\d_]', re.UNICODE)
+
+          def tamil_ratio(text: str) -> float:
+              letters = letter_re.findall(text)
+              if not letters:
+                  return 0.0
+              return sum(bool(tamil_re.match(ch)) for ch in letters) / len(letters)
+
+          candidates = []
+          for left in range(len(segments)):
+              for right in range(left, min(len(segments), left + 4)):
+                  group = segments[left:right + 1]
+                  if any(group[i + 1]['start'] - group[i]['end'] > 0.8 for i in range(len(group) - 1)):
+                      break
+                  start = group[0]['start']
+                  end = group[-1]['end']
+                  duration = end - start
+                  if duration > 9.5:
+                      break
+                  if duration < 4.0:
+                      continue
+                  text = ' '.join(item['text'] for item in group).strip()
+                  ratio = tamil_ratio(text)
+                  if not 18 <= len(text) <= 150 or ratio < 0.55:
+                      continue
+                  avg_logprob = sum(item['avg_logprob'] for item in group) / len(group)
+                  no_speech = max(item['no_speech_prob'] for item in group)
+                  if no_speech > 0.35 or avg_logprob < -1.25:
+                      continue
+                  score = (
+                      avg_logprob
+                      + 1.5 * ratio
+                      - 0.12 * abs(duration - 6.5)
+                      - 1.5 * no_speech
+                  )
+                  candidates.append({
+                      'start': start,
+                      'end': end,
+                      'duration': duration,
+                      'text': text,
+                      'score': score,
+                      'tamil_ratio': ratio,
+                  })
+
+          candidates.sort(key=lambda item: item['score'], reverse=True)
+          selected = []
+          for candidate in candidates:
+              if any(
+                  max(0.0, min(candidate['end'], old['end']) - max(candidate['start'], old['start']))
+                  / min(candidate['duration'], old['duration']) > 0.7
+                  for old in selected
+              ):
+                  continue
+              selected.append(candidate)
+              if len(selected) == 3:
+                  break
+
+          if not selected:
+              raise SystemExit('No sufficiently clean 4-9 second Tamil reference segment found')
+
+          fade_samples = int(sample_rate * 0.025)
+          public_metadata = []
+          for index, candidate in enumerate(selected, start=1):
+              start_sample = max(0, int((candidate['start'] - 0.04) * sample_rate))
+              end_sample = min(len(audio), int((candidate['end'] + 0.04) * sample_rate))
+              clip = audio[start_sample:end_sample].copy()
+              if len(clip) < int(3.8 * sample_rate):
+                  continue
+              fade = np.linspace(0.0, 1.0, fade_samples, dtype=np.float32)
+              clip[:fade_samples] *= fade
+              clip[-fade_samples:] *= fade[::-1]
+              clip /= max(1.0, float(np.max(np.abs(clip))) / 0.94)
+              sf.write(f'data/private/reference_candidate_{index}.wav', clip, sample_rate, subtype='PCM_16')
+              Path(f'data/private/reference_candidate_{index}.txt').write_text(
+                  candidate['text'], encoding='utf-8'
+              )
+              public_metadata.append({
+                  'id': index,
+                  'relative_start_seconds': round(candidate['start'], 3),
+                  'relative_end_seconds': round(candidate['end'], 3),
+                  'duration_seconds': round(candidate['duration'], 3),
+                  'tamil_ratio': round(candidate['tamil_ratio'], 3),
+              })
+
+          if not public_metadata:
+              raise SystemExit('Candidate extraction produced no usable reference clips')
+          Path('data/private/reference_candidates.json').write_text(
+              json.dumps({'count': len(public_metadata), 'candidates': public_metadata}, indent=2),
+              encoding='utf-8',
+          )
+          print(f'Selected {len(public_metadata)} protected short-reference candidates; transcripts not logged.')
           PY
 
-      - name: Generate one Tamil cloned-voice gate
+      - name: Generate and automatically reject garbled candidates
         shell: bash
         run: |
           set -euo pipefail
-          cat > data/private/cases.json <<'JSON'
-          {
-            "voice_id": "voice_001_0700_0730",
-            "cases": [
-              {
-                "id": "tamil_clone_0700_gate",
-                "language": "ta",
-                "text": "இந்த அமைப்பு தமிழ் சொற்களை இயல்பான உச்சரிப்பில் பேசுகிறதா என்று பார்க்கிறோம்."
-              }
-            ]
-          }
-          JSON
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import shutil
+          import time
+          from difflib import SequenceMatcher
+          from pathlib import Path
 
-          python scripts/run_dhee_baseline.py \
-            --reference data/private/voice_001_ref_0700_0730.wav \
-            --reference-text "$(cat data/private/voice_001_ref_0700_0730.txt)" \
-            --cases data/private/cases.json \
-            --compat-model-id AbhishekDelMundu/IndicF5 \
-            --output-dir outputs/voice_001_indicf5_0700
+          import numpy as np
+          import soundfile as sf
+          from faster_whisper import WhisperModel
+          from transformers import AutoModel
+
+          from scripts.run_dhee_baseline import prepare_compatible_snapshot, validate_waveform
+
+          target_text = 'இது இயல்பான தெளிவான தமிழ் குரல் சோதனை.'
+          output_dir = Path('outputs/voice_001_indicf5_0700')
+          output_dir.mkdir(parents=True, exist_ok=True)
+
+          token = os.environ.get('HF_TOKEN') or None
+          snapshot = prepare_compatible_snapshot(
+              'dheeyantra/dhee-indic-f5',
+              'AbhishekDelMundu/IndicF5',
+              token,
+          )
+          started = time.perf_counter()
+          model = AutoModel.from_pretrained(
+              snapshot,
+              trust_remote_code=True,
+              local_files_only=True,
+          )
+          model_load_seconds = time.perf_counter() - started
+
+          verifier = WhisperModel(
+              'large-v3-turbo',
+              device='cpu',
+              compute_type='int8',
+              cpu_threads=4,
+              num_workers=1,
+          )
+          tamil_re = re.compile(r'[\u0B80-\u0BFF]')
+
+          def normalize(text: str) -> str:
+              return ''.join(ch for ch in text if tamil_re.match(ch))
+
+          target_normalized = normalize(target_text)
+          attempts = []
+          best = None
+
+          for reference_path in sorted(Path('data/private').glob('reference_candidate_*.wav')):
+              candidate_id = reference_path.stem.rsplit('_', 1)[-1]
+              transcript_path = reference_path.with_suffix('.txt')
+              reference_text = transcript_path.read_text(encoding='utf-8').strip()
+              temp_output = Path(f'data/private/generated_candidate_{candidate_id}.wav')
+              try:
+                  case_started = time.perf_counter()
+                  generated = model(
+                      target_text,
+                      ref_audio_path=str(reference_path),
+                      ref_text=reference_text,
+                  )
+                  waveform = np.asarray(generated)
+                  if waveform.dtype == np.int16:
+                      waveform = waveform.astype(np.float32) / 32768.0
+                  waveform = waveform.astype(np.float32).reshape(-1)
+                  metrics = validate_waveform(waveform, f'candidate_{candidate_id}')
+                  duration = len(waveform) / 24000
+                  sf.write(temp_output, waveform, 24000, subtype='PCM_16')
+
+                  verify_segments, _ = verifier.transcribe(
+                      str(temp_output),
+                      language='ta',
+                      beam_size=5,
+                      vad_filter=True,
+                      condition_on_previous_text=False,
+                      temperature=0,
+                  )
+                  hypothesis = ' '.join(s.text.strip() for s in verify_segments if s.text.strip())
+                  hypothesis_normalized = normalize(hypothesis)
+                  similarity = SequenceMatcher(None, target_normalized, hypothesis_normalized).ratio()
+                  tamil_fraction = (
+                      len(hypothesis_normalized) / max(1, sum(ch.isalpha() for ch in hypothesis))
+                  )
+                  duration_ok = 2.0 <= duration <= 11.0
+                  intelligible = similarity >= 0.48 and tamil_fraction >= 0.55
+                  accepted = duration_ok and intelligible
+                  elapsed = time.perf_counter() - case_started
+
+                  result = {
+                      'candidate_id': int(candidate_id),
+                      'duration_seconds': round(duration, 3),
+                      'generation_seconds': round(elapsed, 3),
+                      'asr_similarity': round(similarity, 4),
+                      'asr_tamil_fraction': round(tamil_fraction, 4),
+                      'duration_ok': duration_ok,
+                      'intelligible': intelligible,
+                      'accepted': accepted,
+                      **metrics,
+                  }
+                  attempts.append(result)
+                  print(
+                      f'Candidate {candidate_id}: duration={duration:.2f}s, '
+                      f'ASR similarity={similarity:.3f}, Tamil fraction={tamil_fraction:.3f}, '
+                      f'accepted={accepted}'
+                  )
+
+                  rank = similarity + 0.15 * tamil_fraction - 0.03 * abs(duration - 5.0)
+                  if accepted and (best is None or rank > best['rank']):
+                      best = {
+                          'rank': rank,
+                          'path': temp_output,
+                          'candidate_id': int(candidate_id),
+                          'result': result,
+                      }
+              except Exception as exc:
+                  attempts.append({
+                      'candidate_id': int(candidate_id),
+                      'accepted': False,
+                      'error_type': type(exc).__name__,
+                  })
+                  print(f'Candidate {candidate_id} rejected with {type(exc).__name__}; details suppressed.')
+
+          if best is None:
+              Path('outputs/voice_001_indicf5_0700/antigarble_report.json').write_text(
+                  json.dumps({
+                      'status': 'REJECTED_ALL_GARBLED_CANDIDATES',
+                      'model_load_seconds': model_load_seconds,
+                      'attempts': attempts,
+                  }, indent=2),
+                  encoding='utf-8',
+              )
+              raise SystemExit('All generated candidates failed duration/intelligibility gates; no audio will be uploaded')
+
+          final_path = output_dir / 'tamil_clone_0700_antigarble.wav'
+          shutil.copyfile(best['path'], final_path)
+          report = {
+              'status': 'PENDING_HUMAN_LISTENING_REVIEW',
+              'selected_candidate_id': best['candidate_id'],
+              'model_load_seconds': model_load_seconds,
+              'selected_metrics': best['result'],
+              'attempts': attempts,
+              'target_text': target_text,
+          }
+          (output_dir / 'antigarble_report.json').write_text(
+              json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+          print('Selected one candidate that passed automated duration and Tamil intelligibility gates.')
+          PY
 
       - name: Validate, encrypt, and remove private material
         shell: bash
         run: |
           set -euo pipefail
-          test -s outputs/voice_001_indicf5_0700/tamil_clone_0700_gate.wav
-          ffprobe -v error -select_streams a:0 \
-            -show_entries stream=sample_rate,channels,duration \
-            -of default=noprint_wrappers=1 \
-            outputs/voice_001_indicf5_0700/tamil_clone_0700_gate.wav
+          test -s outputs/voice_001_indicf5_0700/tamil_clone_0700_antigarble.wav
+          duration="$(ffprobe -v error -show_entries format=duration \
+            -of default=noprint_wrappers=1:nokey=1 \
+            outputs/voice_001_indicf5_0700/tamil_clone_0700_antigarble.wav)"
+          python - "$duration" <<'PY'
+          import sys
+          duration = float(sys.argv[1])
+          if not 2.0 <= duration <= 11.0:
+              raise SystemExit(f'Final duration gate failed: {duration:.3f}s')
+          print(f'Final anti-garble sample duration: {duration:.3f}s')
+          PY
 
-          tar -czf outputs/voice_001_indicf5_0700.tar.gz \
+          tar -czf outputs/voice_001_indicf5_0700_antigarble.tar.gz \
             -C outputs voice_001_indicf5_0700
           openssl enc -aes-256-cbc -pbkdf2 -iter 250000 -salt \
-            -in outputs/voice_001_indicf5_0700.tar.gz \
-            -out outputs/voice_001_indicf5_0700.tar.gz.enc \
+            -in outputs/voice_001_indicf5_0700_antigarble.tar.gz \
+            -out outputs/voice_001_indicf5_0700_antigarble.tar.gz.enc \
             -pass env:VOICE_001_KEY
 
           rm -rf \
             data/private \
             outputs/voice_001_indicf5_0700 \
-            outputs/voice_001_indicf5_0700.tar.gz
+            outputs/voice_001_indicf5_0700_antigarble.tar.gz
 
       - name: Remove private material after failure
         if: failure()
         shell: bash
         run: rm -rf data/private outputs/voice_001_indicf5_0700
 
-      - name: Upload encrypted Tamil gate only
+      - name: Upload encrypted anti-garble Tamil gate only
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: voice-001-indicf5-0700-clone-encrypted
-          path: outputs/voice_001_indicf5_0700.tar.gz.enc
+          name: voice-001-indicf5-0700-antigarble-encrypted
+          path: outputs/voice_001_indicf5_0700_antigarble.tar.gz.enc
           if-no-files-found: error
           retention-days: 1
