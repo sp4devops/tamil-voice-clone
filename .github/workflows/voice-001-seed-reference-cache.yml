@@ -33,7 +33,6 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ffmpeg
-          gh --version
 
       - name: Validate protected input
         shell: bash
@@ -42,30 +41,32 @@ jobs:
           test -n "$VOICE_001_KEY"
           test -s .github/reference/voice_001_ref_compact.opus.enc.b64
 
-      - name: Delete stale immutable cache
+      - name: Delete stale immutable cache by ID
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          encoded_key="$(python - <<'PY'
-          import os
-          import urllib.parse
-          print(urllib.parse.quote(os.environ['CACHE_KEY'], safe=''))
-          PY
-          )"
-          status="$(curl --silent --show-error --output /tmp/cache-delete.json \
-            --write-out '%{http_code}' --request DELETE \
+          cache_ids="$(curl --fail --silent --show-error \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header 'Accept: application/vnd.github+json' \
             --header 'X-GitHub-Api-Version: 2022-11-28' \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/caches?key=${encoded_key}")"
-          if [[ "$status" != '204' && "$status" != '404' ]]; then
-            cat /tmp/cache-delete.json
-            echo "::error::Failed to delete stale cache; HTTP $status"
-            exit 1
-          fi
-          echo "Deleted stale cache key if it existed: $CACHE_KEY"
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/caches?key=${CACHE_KEY}" \
+            | python -c 'import json,sys; print(" ".join(str(x["id"]) for x in json.load(sys.stdin).get("actions_caches", [])))')"
+          for cache_id in $cache_ids; do
+            status="$(curl --silent --show-error --output /tmp/cache-delete.json \
+              --write-out '%{http_code}' --request DELETE \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header 'Accept: application/vnd.github+json' \
+              --header 'X-GitHub-Api-Version: 2022-11-28' \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/caches/${cache_id}")"
+            if [[ "$status" != '204' && "$status" != '404' ]]; then
+              cat /tmp/cache-delete.json
+              echo "::error::Failed to delete cache ID $cache_id; HTTP $status"
+              exit 1
+            fi
+            echo "Deleted stale cache ID $cache_id"
+          done
 
       - name: Build validated 40-second encrypted reference
         shell: bash
