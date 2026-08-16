@@ -1,0 +1,94 @@
+name: voice-001-seed-reference-cache
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/voice-001-seed-reference-cache.yml'
+      - '.github/reference/voice_001_ref_compact.opus.enc.b64'
+
+permissions:
+  contents: read
+
+jobs:
+  seed-reference-cache:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      VOICE_001_KEY: ${{ secrets.VOICE_001_KEY }}
+      CACHE_KEY: voice-001-reference-tY_3TiehDFU-0700-40-v1
+
+    steps:
+      - name: Checkout encrypted reference
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Install audio tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+
+      - name: Validate protected input
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$VOICE_001_KEY"
+          test -s .github/reference/voice_001_ref_compact.opus.enc.b64
+
+      - name: Restore existing reference cache
+        id: reference-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: data/private/voice_001_ref.wav.enc
+          key: ${{ env.CACHE_KEY }}
+
+      - name: Build encrypted normalized reference
+        if: steps.reference-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data/private
+          base64 --decode \
+            .github/reference/voice_001_ref_compact.opus.enc.b64 \
+            > data/private/reference.opus.enc
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 250000 \
+            -in data/private/reference.opus.enc \
+            -out data/private/reference.opus \
+            -pass env:VOICE_001_KEY
+          ffmpeg -y -hide_banner -loglevel error \
+            -i data/private/reference.opus \
+            -ac 1 -ar 24000 -c:a pcm_s24le \
+            data/private/voice_001_ref.wav
+          duration="$(ffprobe -v error -show_entries format=duration \
+            -of default=noprint_wrappers=1:nokey=1 \
+            data/private/voice_001_ref.wav)"
+          python - "$duration" <<'PY'
+          import sys
+          duration = float(sys.argv[1])
+          if not 5.0 <= duration <= 6.0:
+              raise SystemExit(f'Unexpected reference duration: {duration:.3f}s')
+          print(f'Validated compact reference: {duration:.3f}s')
+          PY
+          openssl enc -aes-256-cbc -pbkdf2 -iter 250000 -salt \
+            -in data/private/voice_001_ref.wav \
+            -out data/private/voice_001_ref.wav.enc \
+            -pass env:VOICE_001_KEY
+          rm -f data/private/reference.opus.enc \
+            data/private/reference.opus \
+            data/private/voice_001_ref.wav
+
+      - name: Save encrypted reference cache
+        if: steps.reference-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: data/private/voice_001_ref.wav.enc
+          key: ${{ env.CACHE_KEY }}
+
+      - name: Remove private material
+        if: always()
+        shell: bash
+        run: rm -rf data/private
