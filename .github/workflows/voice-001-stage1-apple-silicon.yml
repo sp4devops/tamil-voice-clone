@@ -100,7 +100,7 @@ jobs:
 
           cat .github/reference/voice_001_ref_exact_4s.opus.enc.b64.part* \
             | base64 -D > data/private/reference.opus.enc
-          base64 -D .github/reference/voice_001_ref_exact_4s.txt.enc.b64 \
+          base64 -D -i .github/reference/voice_001_ref_exact_4s.txt.enc.b64 \
             > data/private/reference.txt.enc
 
           OPENSSL_BIN="$(brew --prefix openssl@3)/bin/openssl"
