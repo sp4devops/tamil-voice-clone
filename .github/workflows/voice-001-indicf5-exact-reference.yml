@@ -8,6 +8,7 @@ on:
       - '.github/workflows/voice-001-indicf5-exact-reference.yml'
       - '.github/reference/voice_001_ref_exact_4s.*'
       - 'scripts/run_dhee_baseline.py'
+      - 'scripts/run_tail_conditioned_gate.py'
 
 concurrency:
   group: voice-001-indicf5-exact-reference
@@ -19,7 +20,7 @@ permissions:
 jobs:
   synthesize:
     runs-on: ubuntu-24.04
-    timeout-minutes: 150
+    timeout-minutes: 90
     env:
       VOICE_001_KEY: ${{ secrets.VOICE_001_KEY }}
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -109,121 +110,14 @@ jobs:
           print(f'Validated exact protected reference pair: {duration:.3f}s')
           PY
 
-      - name: Generate strict candidates
+      - name: Generate and verify tail-conditioned chunks
         shell: bash
         run: |
           set -euo pipefail
-          python - <<'PY'
-          import json
-          import os
-          import re
-          import shutil
-          import time
-          from difflib import SequenceMatcher
-          from pathlib import Path
-
-          import numpy as np
-          import soundfile as sf
-          import torch
-          from faster_whisper import WhisperModel
-          from transformers import AutoModel
-
-          from scripts.run_dhee_baseline import prepare_compatible_snapshot, validate_waveform
-
-          target_text = 'இது தெளிவான இயல்பான தமிழ் குரல்.'
-          target_clean = ''.join(re.findall(r'[\u0B80-\u0BFF]', target_text))
-          prefix_len = max(8, round(len(target_clean) * 0.55))
-          target_prefix = target_clean[:prefix_len]
-          reference_text = Path('data/private/reference.txt').read_text(encoding='utf-8').strip()
-
-          snapshot = prepare_compatible_snapshot(
-              'dheeyantra/dhee-indic-f5',
-              'AbhishekDelMundu/IndicF5',
-              os.environ.get('HF_TOKEN') or None,
-          )
-          model = AutoModel.from_pretrained(
-              snapshot, trust_remote_code=True, local_files_only=True
-          )
-          verifier = WhisperModel(
-              'large-v3-turbo', device='cpu', compute_type='int8',
-              cpu_threads=4, num_workers=1,
-          )
-
-          attempts = []
-          best = None
-          for seed in (7, 11, 19, 29, 47, 71):
-              path = Path(f'data/private/candidate_{seed}.wav')
-              torch.manual_seed(seed)
-              np.random.seed(seed)
-              started = time.perf_counter()
-              generated = model(
-                  target_text,
-                  ref_audio_path='data/private/reference.wav',
-                  ref_text=reference_text,
-              )
-              waveform = np.asarray(generated)
-              if waveform.dtype == np.int16:
-                  waveform = waveform.astype(np.float32) / 32768.0
-              waveform = waveform.astype(np.float32).reshape(-1)
-              signal = validate_waveform(waveform, f'seed_{seed}')
-              duration = len(waveform) / 24000
-              sf.write(path, waveform, 24000, subtype='PCM_16')
-
-              segments, _ = verifier.transcribe(
-                  str(path), language='ta', beam_size=5,
-                  vad_filter=True, condition_on_previous_text=False,
-                  temperature=0,
-              )
-              hypothesis = ' '.join(s.text.strip() for s in segments if s.text.strip())
-              clean = ''.join(re.findall(r'[\u0B80-\u0BFF]', hypothesis))
-              overall = SequenceMatcher(None, target_clean, clean).ratio()
-              prefix = SequenceMatcher(None, target_prefix, clean[:prefix_len]).ratio()
-              length_ratio = len(clean) / max(1, len(target_clean))
-              accepted = (
-                  2.0 <= duration <= 8.0
-                  and 0.82 <= length_ratio <= 1.22
-                  and overall >= 0.90
-                  and prefix >= 0.88
-              )
-              result = {
-                  'seed': seed,
-                  'duration_seconds': round(duration, 3),
-                  'overall_asr_similarity': round(overall, 4),
-                  'prefix_asr_similarity': round(prefix, 4),
-                  'length_ratio': round(length_ratio, 4),
-                  'accepted': accepted,
-                  'generation_seconds': round(time.perf_counter() - started, 3),
-                  **signal,
-              }
-              attempts.append(result)
-              print(
-                  f'seed={seed} duration={duration:.2f} overall={overall:.3f} '
-                  f'prefix={prefix:.3f} length={length_ratio:.3f} accepted={accepted}'
-              )
-              rank = 0.65 * overall + 0.35 * prefix
-              if accepted and (best is None or rank > best['rank']):
-                  best = {'rank': rank, 'path': path, 'metrics': result}
-
-          output_dir = Path('outputs/voice_001_exact_reference')
-          report = {
-              'target_text': target_text,
-              'thresholds': {'overall': 0.90, 'prefix': 0.88},
-              'attempts': attempts,
-          }
-          if best is None:
-              report['status'] = 'REJECTED_NO_FULLY_CLEAR_OUTPUT'
-              (output_dir / 'report.json').write_text(
-                  json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8'
-              )
-              raise SystemExit('No candidate passed strict beginning and whole-sentence gates')
-
-          report['status'] = 'PENDING_HUMAN_LISTENING_REVIEW'
-          report['selected_metrics'] = best['metrics']
-          shutil.copyfile(best['path'], output_dir / 'tamil_exact_reference_gate.wav')
-          (output_dir / 'report.json').write_text(
-              json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8'
-          )
-          PY
+          python scripts/run_tail_conditioned_gate.py \
+            --reference data/private/reference.wav \
+            --reference-text-file data/private/reference.txt \
+            --output-dir outputs/voice_001_exact_reference
 
       - name: Encrypt approved candidate bundle
         shell: bash
@@ -247,7 +141,7 @@ jobs:
       - name: Upload encrypted exact-reference gate
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: voice-001-indicf5-exact-reference-encrypted
+          name: voice-001-indicf5-tail-conditioned-encrypted
           path: outputs/voice_001_exact_reference.tar.gz.enc
           if-no-files-found: error
           retention-days: 1
