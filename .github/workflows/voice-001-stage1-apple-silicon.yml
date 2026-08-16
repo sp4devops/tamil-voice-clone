@@ -85,11 +85,53 @@ jobs:
           python - <<'PY'
           from pathlib import Path
           import f5_tts
-          path = Path(f5_tts.__file__).parent / 'model' / '__init__.py'
-          text = path.read_text(encoding='utf-8')
+
+          package = Path(f5_tts.__file__).parent
+
+          model_init = package / 'model' / '__init__.py'
+          text = model_init.read_text(encoding='utf-8')
           text = text.replace('from f5_tts.model.trainer import Trainer\n', '')
           text = text.replace(', "Trainer"', '')
-          path.write_text(text, encoding='utf-8')
+          model_init.write_text(text, encoding='utf-8')
+
+          utils = package / 'infer' / 'utils_infer.py'
+          text = utils.read_text(encoding='utf-8')
+          eager_matplotlib = (
+              'import matplotlib\n\n'
+              'matplotlib.use("Agg")\n\n'
+              'import matplotlib.pylab as plt\n'
+          )
+          if eager_matplotlib not in text:
+              raise SystemExit('IndicF5 matplotlib import block changed')
+          text = text.replace(eager_matplotlib, '')
+
+          eager_pipeline = 'from transformers import pipeline\n'
+          if eager_pipeline not in text:
+              raise SystemExit('IndicF5 transformers pipeline import changed')
+          text = text.replace(eager_pipeline, '')
+
+          asr_marker = 'def initialize_asr_pipeline(device: str = device, dtype=None):\n'
+          if asr_marker not in text:
+              raise SystemExit('IndicF5 ASR initializer changed')
+          text = text.replace(
+              asr_marker,
+              asr_marker + '    from transformers import pipeline\n',
+              1,
+          )
+
+          spectrogram_marker = 'def save_spectrogram(spectrogram, path):\n'
+          if spectrogram_marker not in text:
+              raise SystemExit('IndicF5 spectrogram helper changed')
+          text = text.replace(
+              spectrogram_marker,
+              spectrogram_marker
+              + '    import matplotlib\n'
+              + '    matplotlib.use("Agg")\n'
+              + '    import matplotlib.pylab as plt\n',
+              1,
+          )
+          utils.write_text(text, encoding='utf-8')
+          print('lean_runtime_import_patch=PASS')
           PY
 
       - name: Recover protected reference pair
@@ -130,6 +172,35 @@ jobs:
             --output-file data/private/effective_reference.txt
           test -s data/private/effective_reference.txt
 
+      - name: Prepare listening-sample retention
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('scripts/run_indicf5_stage1_runtime_benchmark.py')
+          text = path.read_text(encoding='utf-8')
+
+          old_name = 'wav_path = output_dir / f".{target_name}_runtime.wav"'
+          new_name = 'wav_path = output_dir / f"{target_name}_listening_sample.wav"'
+          if old_name not in text:
+              raise SystemExit('Runtime sample filename block changed')
+          text = text.replace(old_name, new_name, 1)
+
+          old_cleanup = (
+              '    finally:\n'
+              '        for wav_path in transient_wavs:\n'
+              '            wav_path.unlink(missing_ok=True)\n'
+          )
+          new_cleanup = '    finally:\n        pass\n'
+          if old_cleanup not in text:
+              raise SystemExit('Runtime sample cleanup block changed')
+          text = text.replace(old_cleanup, new_cleanup, 1)
+          path.write_text(text, encoding='utf-8')
+          print('runtime_listening_sample_retention=PASS')
+          PY
+
       - name: Measure TTS-only Stage 1 runtime
         shell: bash
         run: |
@@ -165,7 +236,7 @@ jobs:
               'status': 'PASS' if max_rss_bytes <= hard_ceiling_bytes else 'MEMORY_CEILING_EXCEEDED',
               'runner': 'macos-14',
               'architecture': platform.machine(),
-              'measurement_scope': 'TTS_ONLY_PROCESS_NO_WHISPER_MODEL',
+              'measurement_scope': 'TTS_ONLY_PROCESS_NO_WHISPER_MODEL_LAZY_PLOTTING_IMPORTS',
               'physical_memory_bytes': physical_memory_bytes,
               'physical_memory_gib': round(physical_memory_bytes / (1024 ** 3), 3),
               'maximum_resident_set_bytes': max_rss_bytes,
@@ -193,6 +264,61 @@ jobs:
           set -euo pipefail
           test -s outputs/stage1_apple_silicon_runtime/runtime_report.json
           test -s outputs/stage1_apple_silicon_runtime/apple_silicon_runtime_benchmark.json
+          test -s outputs/stage1_apple_silicon_runtime/english_listening_sample.wav
+          test -s outputs/stage1_apple_silicon_runtime/mixed_listening_sample.wav
+
+      - name: Verify listening samples outside measured runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          sys.path.insert(0, str(Path('scripts').resolve()))
+          from faster_whisper import WhisperModel
+          from run_indicf5_stage1_multilingual import TARGETS, verify_english, verify_mixed
+
+          output_dir = Path('outputs/stage1_apple_silicon_runtime')
+          verifier = WhisperModel(
+              'large-v3-turbo',
+              device='cpu',
+              compute_type='int8',
+              cpu_threads=4,
+              num_workers=1,
+          )
+
+          english_path = output_dir / 'english_listening_sample.wav'
+          mixed_path = output_dir / 'mixed_listening_sample.wav'
+          english = verify_english(verifier, english_path, str(TARGETS['english']['text']))
+          mixed = verify_mixed(verifier, mixed_path, str(TARGETS['mixed']['text']))
+          accepted = bool(english['accepted'] and mixed['accepted'])
+          report = {
+              'status': 'PASS' if accepted else 'REJECTED_STRICT_ASR_GATE',
+              'english': english,
+              'mixed': mixed,
+          }
+          (output_dir / 'listening_sample_verification.json').write_text(
+              json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+          print('listening_sample_verification=' + ('PASS' if accepted else 'FAIL'))
+          if not accepted:
+              english_path.unlink(missing_ok=True)
+              mixed_path.unlink(missing_ok=True)
+              raise SystemExit('Runtime listening samples rejected by strict ASR gate')
+          PY
+
+      - name: Upload verified Stage 1 listening samples
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: voice-001-stage1-apple-silicon-listening-samples
+          path: |
+            outputs/stage1_apple_silicon_runtime/english_listening_sample.wav
+            outputs/stage1_apple_silicon_runtime/mixed_listening_sample.wav
+            outputs/stage1_apple_silicon_runtime/listening_sample_verification.json
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Remove protected and transient material
         if: always()
@@ -210,6 +336,7 @@ jobs:
           path: |
             outputs/stage1_apple_silicon_runtime/runtime_report.json
             outputs/stage1_apple_silicon_runtime/apple_silicon_runtime_benchmark.json
+            outputs/stage1_apple_silicon_runtime/listening_sample_verification.json
           if-no-files-found: warn
           retention-days: 7
 
