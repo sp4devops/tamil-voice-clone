@@ -85,65 +85,86 @@ jobs:
           test -n "$YT_DLP_VERSION"
           test -n "$YT_DLP_SHA256"
 
-      - name: Download and validate YouTube voice reference
+      - name: Restore encrypted voice reference cache
+        id: reference-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: data/private/voice_001_ref.wav.enc
+          key: voice-001-reference-${{ env.REFERENCE_VIDEO_ID }}-0700-40-v1
+
+      - name: Download or restore and validate voice reference
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p data/private outputs/reports tools
-          curl --fail --silent --show-error --location \
-            "https://github.com/yt-dlp/yt-dlp/releases/download/${YT_DLP_VERSION}/yt-dlp" \
-            --output tools/yt-dlp
-          printf '%s  %s\n' "$YT_DLP_SHA256" tools/yt-dlp \
-            | sha256sum --check --strict
-          chmod 0700 tools/yt-dlp
-          tools/yt-dlp --version
 
-          yt_args=(
-            --no-playlist
-            --js-runtimes node
-            --remote-components ejs:github
-            --extractor-args 'youtube:player_client=tv,web_safari,web_embedded'
-            --retries 3
-            --fragment-retries 3
-          )
-
-          if [[ -n "${YOUTUBE_COOKIES_B64:-}" ]]; then
-            printf '%s' "$YOUTUBE_COOKIES_B64" \
-              | base64 --decode > data/private/youtube-cookies.txt
-            chmod 0600 data/private/youtube-cookies.txt
-            yt_args+=(--cookies data/private/youtube-cookies.txt)
-            echo 'Using protected YouTube cookies secret.'
+          if [[ -s data/private/voice_001_ref.wav.enc ]]; then
+            openssl enc -d -aes-256-cbc -pbkdf2 -iter 250000 \
+              -in data/private/voice_001_ref.wav.enc \
+              -out data/private/voice_001_ref.wav \
+              -pass env:VOICE_001_KEY
+            echo 'Restored encrypted voice reference cache; YouTube download skipped.'
           else
-            echo 'No YouTube cookies secret configured; using Node/EJS and alternate clients.'
+            curl --fail --silent --show-error --location \
+              "https://github.com/yt-dlp/yt-dlp/releases/download/${YT_DLP_VERSION}/yt-dlp" \
+              --output tools/yt-dlp
+            printf '%s  %s\n' "$YT_DLP_SHA256" tools/yt-dlp \
+              | sha256sum --check --strict
+            chmod 0700 tools/yt-dlp
+            tools/yt-dlp --version
+
+            yt_args=(
+              --no-playlist
+              --js-runtimes node
+              --remote-components ejs:github
+              --extractor-args 'youtube:player_client=tv,web_safari,web_embedded'
+              --retries 3
+              --fragment-retries 3
+            )
+
+            if [[ -n "${YOUTUBE_COOKIES_B64:-}" ]]; then
+              printf '%s' "$YOUTUBE_COOKIES_B64" \
+                | base64 --decode > data/private/youtube-cookies.txt
+              chmod 0600 data/private/youtube-cookies.txt
+              yt_args+=(--cookies data/private/youtube-cookies.txt)
+              echo 'Using protected YouTube cookies secret.'
+            else
+              echo 'No YouTube cookies secret configured; using Node/EJS and alternate clients.'
+            fi
+
+            if ! actual_video_id="$(tools/yt-dlp \
+              "${yt_args[@]}" \
+              --skip-download \
+              --print id \
+              "$REFERENCE_VIDEO_URL")"; then
+              echo '::error::YouTube rejected the hosted runner or the saved cookies. Refresh YOUTUBE_COOKIES_B64 using a private/incognito YouTube session, then rerun.'
+              exit 1
+            fi
+            test "$actual_video_id" = "$REFERENCE_VIDEO_ID"
+
+            tools/yt-dlp \
+              "${yt_args[@]}" \
+              --format 'bestaudio/best' \
+              --output 'data/private/reference_source.%(ext)s' \
+              "$REFERENCE_VIDEO_URL"
+
+            source_path="$(find data/private -maxdepth 1 -type f \
+              -name 'reference_source.*' ! -name '*.part' -print -quit)"
+            test -n "$source_path"
+
+            ffmpeg -y -hide_banner -loglevel error \
+              -ss "$REFERENCE_START" \
+              -i "$source_path" \
+              -t "$REFERENCE_DURATION_SECONDS" \
+              -vn -ac 1 -ar 24000 -c:a pcm_s24le \
+              data/private/voice_001_ref.wav
+            rm -f "$source_path" data/private/youtube-cookies.txt tools/yt-dlp
+
+            openssl enc -aes-256-cbc -pbkdf2 -iter 250000 -salt \
+              -in data/private/voice_001_ref.wav \
+              -out data/private/voice_001_ref.wav.enc \
+              -pass env:VOICE_001_KEY
           fi
-
-          if ! actual_video_id="$(tools/yt-dlp \
-            "${yt_args[@]}" \
-            --skip-download \
-            --print id \
-            "$REFERENCE_VIDEO_URL")"; then
-            echo '::error::YouTube blocked this hosted runner. Add an Actions secret named YOUTUBE_COOKIES_B64 containing a base64-encoded Netscape cookies file.'
-            exit 1
-          fi
-          test "$actual_video_id" = "$REFERENCE_VIDEO_ID"
-
-          tools/yt-dlp \
-            "${yt_args[@]}" \
-            --format 'bestaudio/best' \
-            --output 'data/private/reference_source.%(ext)s' \
-            "$REFERENCE_VIDEO_URL"
-
-          source_path="$(find data/private -maxdepth 1 -type f \
-            -name 'reference_source.*' ! -name '*.part' -print -quit)"
-          test -n "$source_path"
-
-          ffmpeg -y -hide_banner -loglevel error \
-            -ss "$REFERENCE_START" \
-            -i "$source_path" \
-            -t "$REFERENCE_DURATION_SECONDS" \
-            -vn -ac 1 -ar 24000 -c:a pcm_s24le \
-            data/private/voice_001_ref.wav
-          rm -f "$source_path" data/private/youtube-cookies.txt tools/yt-dlp
 
           ffprobe -v error \
             -show_entries stream=sample_rate,channels:format=duration \
@@ -165,8 +186,15 @@ jobs:
               )
           if int(stream['channels']) != 1 or int(stream['sample_rate']) != 24000:
               raise SystemExit(f'Unexpected normalized reference format: {stream}')
-          print(f'Validated YouTube reference: {duration:.2f}s, mono, 24 kHz')
+          print(f'Validated voice reference: {duration:.2f}s, mono, 24 kHz')
           PY
+
+      - name: Save encrypted voice reference cache
+        if: steps.reference-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: data/private/voice_001_ref.wav.enc
+          key: voice-001-reference-${{ env.REFERENCE_VIDEO_ID }}-0700-40-v1
 
       - name: Create isolated Indic Parler environment
         shell: bash
