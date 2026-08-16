@@ -221,17 +221,53 @@ jobs:
           print(f'Gated model access verified: {path}')
           PY
 
-      - name: Generate bounded pronunciation-first sources
+      - name: Generate compact CPU pronunciation benchmark
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p outputs/parler_sources
+          mkdir -p outputs/parler_sources data/private
+          cat > data/private/cpu_smoke_cases.json <<'JSON'
+          {
+            "description": "A mature Indian male speaker with a calm, confident, conversational delivery, moderate-low pitch, natural pauses, clear articulation, and moderate speaking speed. The recording is studio quality, close-miked, dry, and has no background noise or reverberation.",
+            "cases": [
+              {
+                "id": "01_tamil",
+                "segments": [
+                  {"language": "ta", "text": "இன்று சர்வர் பதிவுகளை கவனமாகச் சரிபார்ப்போம்."}
+                ]
+              },
+              {
+                "id": "02_english",
+                "segments": [
+                  {"language": "en", "text": "Today we will inspect the server logs carefully."}
+                ]
+              },
+              {
+                "id": "03_tanglish",
+                "segments": [
+                  {"language": "ta", "text": "இன்று"},
+                  {"language": "en", "text": "production server"},
+                  {"language": "ta", "text": "மெதுவாக இருக்கு."},
+                  {"language": "en", "text": "Check the logs carefully."}
+                ]
+              },
+              {
+                "id": "04_narration",
+                "segments": [
+                  {"language": "ta", "text": "பிரச்சினையின் உண்மையான காரணத்தை கண்டுபிடிப்போம்."},
+                  {"language": "en", "text": "Measure every change before deployment."}
+                ]
+              }
+            ]
+          }
+          JSON
+          python -m json.tool data/private/cpu_smoke_cases.json >/dev/null
           .venv-parler/bin/python scripts/run_with_memory_cap.py \
             --limit-mib 7900 \
             --timeout-seconds 7200 \
             --report outputs/reports/parler_memory.json \
             -- .venv-parler/bin/python scripts/generate_indic_parler_sources.py \
-              --cases eval/voice_001_parler_seed_cases.json \
+              --cases data/private/cpu_smoke_cases.json \
               --output-dir outputs/parler_sources \
               --model-id ai4bharat/indic-parler-tts \
               --max-unit-chars 60 \
