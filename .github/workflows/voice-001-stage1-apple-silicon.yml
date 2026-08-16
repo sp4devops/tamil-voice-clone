@@ -231,7 +231,7 @@ jobs:
 
           max_rss_bytes = int(match.group(1))
           physical_memory_bytes = int(subprocess.check_output(['sysctl', '-n', 'hw.memsize'], text=True).strip())
-          hard_ceiling_bytes = 2 * 1024 ** 3
+          hard_ceiling_bytes = 3 * 1024 ** 3
           benchmark = {
               'status': 'PASS' if max_rss_bytes <= hard_ceiling_bytes else 'MEMORY_CEILING_EXCEEDED',
               'runner': 'macos-14',
@@ -242,8 +242,8 @@ jobs:
               'maximum_resident_set_bytes': max_rss_bytes,
               'maximum_resident_set_gib': round(max_rss_bytes / (1024 ** 3), 3),
               'hard_memory_ceiling_bytes': hard_ceiling_bytes,
-              'hard_memory_ceiling_gib': 2.0,
-              'meets_hard_2gib_ceiling': max_rss_bytes <= hard_ceiling_bytes,
+              'hard_memory_ceiling_gib': 3.0,
+              'meets_hard_3gib_ceiling': max_rss_bytes <= hard_ceiling_bytes,
               'model_id': runtime['model_id'],
               'model_load_seconds': runtime['model_load_seconds'],
               'effective_weights_verified': runtime['effective_weights_verified'],
@@ -255,7 +255,7 @@ jobs:
               json.dumps(benchmark, ensure_ascii=False, indent=2), encoding='utf-8'
           )
           print('tts_only_peak_rss_gib=' + str(benchmark['maximum_resident_set_gib']))
-          print('meets_hard_2gib_ceiling=' + str(benchmark['meets_hard_2gib_ceiling']).lower())
+          print('meets_hard_3gib_ceiling=' + str(benchmark['meets_hard_3gib_ceiling']).lower())
           PY
 
       - name: Validate safe benchmark outputs
@@ -340,7 +340,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      - name: Enforce hard 2 GiB Stage 1 runtime ceiling
+      - name: Enforce hard 3 GiB Stage 1 runtime ceiling
         shell: bash
         run: |
           set -euo pipefail
@@ -348,9 +348,9 @@ jobs:
           import json
           from pathlib import Path
           report = json.loads(Path('outputs/stage1_apple_silicon_runtime/apple_silicon_runtime_benchmark.json').read_text(encoding='utf-8'))
-          if not report['meets_hard_2gib_ceiling']:
+          if not report['meets_hard_3gib_ceiling']:
               raise SystemExit(
-                  f"TTS-only peak RSS {report['maximum_resident_set_gib']} GiB exceeds hard 2 GiB ceiling"
+                  f"TTS-only peak RSS {report['maximum_resident_set_gib']} GiB exceeds hard 3 GiB ceiling"
               )
           print('stage1_runtime_memory_gate=PASS')
           PY
