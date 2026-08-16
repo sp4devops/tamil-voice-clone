@@ -22,6 +22,7 @@ jobs:
       VIDEO_ID: tY_3TiehDFU
       START_SECONDS: '420'
       DURATION_SECONDS: '30'
+      CACHE_KEY: voice-001-reference-tY_3TiehDFU-0700-40-v1
       VOICE_001_KEY: ${{ secrets.VOICE_001_KEY }}
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
       OMP_NUM_THREADS: '4'
@@ -33,18 +34,19 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: a0414b927782ba97393277ed41dd7c9814f8bbbf
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: '3.10'
 
-      - name: Install audio, transcription, proof-token, and IndicF5 dependencies
+      - name: Install audio, transcription, and IndicF5 dependencies
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y ffmpeg git
+          sudo apt-get install -y --no-install-recommends ffmpeg git
           python -m pip install --upgrade pip
           pip install --index-url https://download.pytorch.org/whl/cpu \
             'torch==2.6.0' 'torchaudio==2.6.0'
@@ -63,20 +65,9 @@ jobs:
             'ema-pytorch>=0.5.2' \
             'x-transformers>=1.31.14' \
             'faster-whisper==1.2.0' \
-            'yt-dlp[default]>=2026.8.1' \
-            'bgutil-ytdlp-pot-provider==1.3.1' \
             cached_path click hydra-core jieba pypinyin tomli tqdm
           pip install --no-deps \
             git+https://github.com/AI4Bharat/IndicF5.git@13f7c4d627cc10111aea8fe9c0039462cacacdc7
-
-          git clone --depth 1 --branch 1.3.1 \
-            https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git \
-            /tmp/bgutil-ytdlp-pot-provider
-          pushd /tmp/bgutil-ytdlp-pot-provider/server
-          npm ci
-          npx tsc
-          popd
-
           python - <<'PY'
           from pathlib import Path
           import f5_tts
@@ -88,36 +79,37 @@ jobs:
           model_init.write_text(source, encoding='utf-8')
           PY
 
-          yt-dlp --version
-          node --version
-
-      - name: Validate encryption key
+      - name: Validate protected inputs
         shell: bash
         run: |
           set -euo pipefail
           test -n "$VOICE_001_KEY"
+          test -n "$HF_TOKEN"
+          test -n "$CACHE_KEY"
 
-      - name: Retrieve exact 07:00-07:30 source segment
+      - name: Restore encrypted 07:00 voice reference cache
+        id: reference-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: data/private/voice_001_ref.wav.enc
+          key: ${{ env.CACHE_KEY }}
+          fail-on-cache-miss: true
+
+      - name: Recover validated 07:00-07:30 reference
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p data/private outputs/voice_001_indicf5_0700
+          test -s data/private/voice_001_ref.wav.enc
 
-          yt-dlp \
-            --remote-components ejs:github \
-            --js-runtimes node \
-            --extractor-args 'youtube:player_client=mweb' \
-            --extractor-args 'youtubepot-bgutilscript:server_home=/tmp/bgutil-ytdlp-pot-provider/server' \
-            --no-playlist \
-            --retries 5 \
-            --fragment-retries 5 \
-            -f 'bestaudio/best' \
-            -o data/private/source_audio \
-            "https://www.youtube.com/watch?v=$VIDEO_ID"
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 250000 \
+            -in data/private/voice_001_ref.wav.enc \
+            -out data/private/voice_001_ref_40s.wav \
+            -pass env:VOICE_001_KEY
 
           ffmpeg -y -hide_banner -loglevel error \
-            -ss "$START_SECONDS" -t "$DURATION_SECONDS" \
-            -i data/private/source_audio \
+            -i data/private/voice_001_ref_40s.wav \
+            -t "$DURATION_SECONDS" \
             -af 'highpass=f=60,lowpass=f=11000,loudnorm=I=-18:TP=-2:LRA=7' \
             -ac 1 -ar 24000 -c:a pcm_s16le \
             data/private/voice_001_ref_0700_0730.wav
@@ -141,6 +133,7 @@ jobs:
 
           metadata = {
               'video_id': 'tY_3TiehDFU',
+              'source_cache_key': 'voice-001-reference-tY_3TiehDFU-0700-40-v1',
               'start_seconds': 420,
               'end_seconds': 450,
               'duration_seconds': duration,
@@ -150,8 +143,9 @@ jobs:
           Path('outputs/voice_001_indicf5_0700/reference_metadata.json').write_text(
               json.dumps(metadata, indent=2), encoding='utf-8'
           )
-          print(f'Validated exact reference window: {duration:.3f}s, mono, {rate} Hz')
+          print(f'Validated cached reference: {duration:.3f}s, mono, {rate} Hz')
           PY
+          rm -f data/private/voice_001_ref_40s.wav
 
       - name: Recover private reference transcript
         shell: bash
