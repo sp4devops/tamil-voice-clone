@@ -1,0 +1,252 @@
+name: voice-001-indicf5-exact-reference
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/voice-001-indicf5-exact-reference.yml'
+      - '.github/reference/voice_001_ref_exact_4s.*'
+
+concurrency:
+  group: voice-001-indicf5-exact-reference
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  synthesize:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    env:
+      VOICE_001_KEY: ${{ secrets.VOICE_001_KEY }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      OMP_NUM_THREADS: '4'
+      MKL_NUM_THREADS: '4'
+      TOKENIZERS_PARALLELISM: 'false'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg git
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu \
+            'torch==2.6.0' 'torchaudio==2.6.0'
+          pip install \
+            'transformers==4.49.0' 'accelerate==0.33.0' \
+            'numpy==1.26.4' 'soundfile>=0.12,<1' \
+            'huggingface-hub>=0.27,<1' 'safetensors>=0.4.5' \
+            'vocos==0.1.0' 'pydub==0.25.1' 'librosa>=0.10.2,<1' \
+            'matplotlib>=3.8,<4' 'torchdiffeq>=0.2.4' \
+            'ema-pytorch>=0.5.2' 'x-transformers>=1.31.14' \
+            'faster-whisper==1.2.0' \
+            cached_path click hydra-core jieba pypinyin tomli tqdm
+          pip install --no-deps \
+            git+https://github.com/AI4Bharat/IndicF5.git@13f7c4d627cc10111aea8fe9c0039462cacacdc7
+          python - <<'PY'
+          from pathlib import Path
+          import f5_tts
+          path = Path(f5_tts.__file__).parent / 'model' / '__init__.py'
+          text = path.read_text(encoding='utf-8')
+          text = text.replace('from f5_tts.model.trainer import Trainer\n', '')
+          text = text.replace(', "Trainer"', '')
+          path.write_text(text, encoding='utf-8')
+          PY
+
+      - name: Recover exact protected reference pair
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$VOICE_001_KEY"
+          test -n "$HF_TOKEN"
+          mkdir -p data/private outputs/voice_001_exact_reference
+
+          cat .github/reference/voice_001_ref_exact_4s.opus.enc.b64.part* \
+            | base64 -d > data/private/reference.opus.enc
+          base64 -d .github/reference/voice_001_ref_exact_4s.txt.enc.b64 \
+            > data/private/reference.txt.enc
+
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 250000 \
+            -in data/private/reference.opus.enc \
+            -out data/private/reference.opus \
+            -pass env:VOICE_001_KEY
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 250000 \
+            -in data/private/reference.txt.enc \
+            -out data/private/reference.txt \
+            -pass env:VOICE_001_KEY
+
+          ffmpeg -y -hide_banner -loglevel error \
+            -i data/private/reference.opus \
+            -ac 1 -ar 24000 -c:a pcm_s16le \
+            data/private/reference.wav
+
+          duration="$(ffprobe -v error -show_entries format=duration \
+            -of default=noprint_wrappers=1:nokey=1 data/private/reference.wav)"
+          python - "$duration" <<'PY'
+          import sys
+          from pathlib import Path
+          duration = float(sys.argv[1])
+          text = Path('data/private/reference.txt').read_text(encoding='utf-8').strip()
+          if not 4.2 <= duration <= 4.9:
+              raise SystemExit(f'Unexpected exact-reference duration: {duration:.3f}s')
+          if len(text) < 8 or not any('\u0b80' <= ch <= '\u0bff' for ch in text):
+              raise SystemExit('Protected reference transcript validation failed')
+          print(f'Validated exact protected reference pair: {duration:.3f}s')
+          PY
+
+      - name: Generate strict candidates
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import shutil
+          import time
+          from difflib import SequenceMatcher
+          from pathlib import Path
+
+          import numpy as np
+          import soundfile as sf
+          import torch
+          from faster_whisper import WhisperModel
+          from transformers import AutoModel
+
+          from scripts.run_dhee_baseline import prepare_compatible_snapshot, validate_waveform
+
+          target_text = 'இது தெளிவான இயல்பான தமிழ் குரல்.'
+          target_clean = ''.join(re.findall(r'[\u0B80-\u0BFF]', target_text))
+          prefix_len = max(8, round(len(target_clean) * 0.55))
+          target_prefix = target_clean[:prefix_len]
+          reference_text = Path('data/private/reference.txt').read_text(encoding='utf-8').strip()
+
+          snapshot = prepare_compatible_snapshot(
+              'dheeyantra/dhee-indic-f5',
+              'AbhishekDelMundu/IndicF5',
+              os.environ.get('HF_TOKEN') or None,
+          )
+          model = AutoModel.from_pretrained(
+              snapshot, trust_remote_code=True, local_files_only=True
+          )
+          verifier = WhisperModel(
+              'large-v3-turbo', device='cpu', compute_type='int8',
+              cpu_threads=4, num_workers=1,
+          )
+
+          attempts = []
+          best = None
+          for seed in (7, 11, 19, 29, 47, 71):
+              path = Path(f'data/private/candidate_{seed}.wav')
+              torch.manual_seed(seed)
+              np.random.seed(seed)
+              started = time.perf_counter()
+              generated = model(
+                  target_text,
+                  ref_audio_path='data/private/reference.wav',
+                  ref_text=reference_text,
+              )
+              waveform = np.asarray(generated)
+              if waveform.dtype == np.int16:
+                  waveform = waveform.astype(np.float32) / 32768.0
+              waveform = waveform.astype(np.float32).reshape(-1)
+              signal = validate_waveform(waveform, f'seed_{seed}')
+              duration = len(waveform) / 24000
+              sf.write(path, waveform, 24000, subtype='PCM_16')
+
+              segments, _ = verifier.transcribe(
+                  str(path), language='ta', beam_size=5,
+                  vad_filter=True, condition_on_previous_text=False,
+                  temperature=0,
+              )
+              hypothesis = ' '.join(s.text.strip() for s in segments if s.text.strip())
+              clean = ''.join(re.findall(r'[\u0B80-\u0BFF]', hypothesis))
+              overall = SequenceMatcher(None, target_clean, clean).ratio()
+              prefix = SequenceMatcher(None, target_prefix, clean[:prefix_len]).ratio()
+              length_ratio = len(clean) / max(1, len(target_clean))
+              accepted = (
+                  2.0 <= duration <= 8.0
+                  and 0.82 <= length_ratio <= 1.22
+                  and overall >= 0.90
+                  and prefix >= 0.88
+              )
+              result = {
+                  'seed': seed,
+                  'duration_seconds': round(duration, 3),
+                  'overall_asr_similarity': round(overall, 4),
+                  'prefix_asr_similarity': round(prefix, 4),
+                  'length_ratio': round(length_ratio, 4),
+                  'accepted': accepted,
+                  'generation_seconds': round(time.perf_counter() - started, 3),
+                  **signal,
+              }
+              attempts.append(result)
+              print(
+                  f'seed={seed} duration={duration:.2f} overall={overall:.3f} '
+                  f'prefix={prefix:.3f} length={length_ratio:.3f} accepted={accepted}'
+              )
+              rank = 0.65 * overall + 0.35 * prefix
+              if accepted and (best is None or rank > best['rank']):
+                  best = {'rank': rank, 'path': path, 'metrics': result}
+
+          output_dir = Path('outputs/voice_001_exact_reference')
+          report = {
+              'target_text': target_text,
+              'thresholds': {'overall': 0.90, 'prefix': 0.88},
+              'attempts': attempts,
+          }
+          if best is None:
+              report['status'] = 'REJECTED_NO_FULLY_CLEAR_OUTPUT'
+              (output_dir / 'report.json').write_text(
+                  json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8'
+              )
+              raise SystemExit('No candidate passed strict beginning and whole-sentence gates')
+
+          report['status'] = 'PENDING_HUMAN_LISTENING_REVIEW'
+          report['selected_metrics'] = best['metrics']
+          shutil.copyfile(best['path'], output_dir / 'tamil_exact_reference_gate.wav')
+          (output_dir / 'report.json').write_text(
+              json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+          PY
+
+      - name: Encrypt approved candidate bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s outputs/voice_001_exact_reference/tamil_exact_reference_gate.wav
+          tar -czf outputs/voice_001_exact_reference.tar.gz \
+            -C outputs voice_001_exact_reference
+          openssl enc -aes-256-cbc -pbkdf2 -iter 250000 -salt \
+            -in outputs/voice_001_exact_reference.tar.gz \
+            -out outputs/voice_001_exact_reference.tar.gz.enc \
+            -pass env:VOICE_001_KEY
+          rm -rf data/private outputs/voice_001_exact_reference \
+            outputs/voice_001_exact_reference.tar.gz
+
+      - name: Remove private material after failure
+        if: failure()
+        shell: bash
+        run: rm -rf data/private outputs/voice_001_exact_reference
+
+      - name: Upload encrypted exact-reference gate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: voice-001-indicf5-exact-reference-encrypted
+          path: outputs/voice_001_exact_reference.tar.gz.enc
+          if-no-files-found: error
+          retention-days: 1
