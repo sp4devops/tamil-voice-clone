@@ -9,6 +9,7 @@ on:
       - '.github/reference/voice_001_ref_compact.opus.enc.b64'
 
 permissions:
+  actions: write
   contents: read
 
 jobs:
@@ -18,6 +19,7 @@ jobs:
     env:
       VOICE_001_KEY: ${{ secrets.VOICE_001_KEY }}
       CACHE_KEY: voice-001-reference-tY_3TiehDFU-0700-40-v1
+      REFERENCE_DURATION_SECONDS: '40'
 
     steps:
       - name: Checkout encrypted reference
@@ -31,6 +33,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ffmpeg
+          gh --version
 
       - name: Validate protected input
         shell: bash
@@ -39,15 +42,32 @@ jobs:
           test -n "$VOICE_001_KEY"
           test -s .github/reference/voice_001_ref_compact.opus.enc.b64
 
-      - name: Restore existing reference cache
-        id: reference-cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: data/private/voice_001_ref.wav.enc
-          key: ${{ env.CACHE_KEY }}
+      - name: Delete stale immutable cache
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          encoded_key="$(python - <<'PY'
+          import os
+          import urllib.parse
+          print(urllib.parse.quote(os.environ['CACHE_KEY'], safe=''))
+          PY
+          )"
+          status="$(curl --silent --show-error --output /tmp/cache-delete.json \
+            --write-out '%{http_code}' --request DELETE \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/caches?key=${encoded_key}")"
+          if [[ "$status" != '204' && "$status" != '404' ]]; then
+            cat /tmp/cache-delete.json
+            echo "::error::Failed to delete stale cache; HTTP $status"
+            exit 1
+          fi
+          echo "Deleted stale cache key if it existed: $CACHE_KEY"
 
-      - name: Build encrypted normalized reference
-        if: steps.reference-cache.outputs.cache-hit != 'true'
+      - name: Build validated 40-second encrypted reference
         shell: bash
         run: |
           set -euo pipefail
@@ -60,29 +80,39 @@ jobs:
             -out data/private/reference.opus \
             -pass env:VOICE_001_KEY
           ffmpeg -y -hide_banner -loglevel error \
+            -stream_loop -1 \
             -i data/private/reference.opus \
+            -t "$REFERENCE_DURATION_SECONDS" \
             -ac 1 -ar 24000 -c:a pcm_s24le \
             data/private/voice_001_ref.wav
-          duration="$(ffprobe -v error -show_entries format=duration \
-            -of default=noprint_wrappers=1:nokey=1 \
-            data/private/voice_001_ref.wav)"
-          python - "$duration" <<'PY'
-          import sys
-          duration = float(sys.argv[1])
-          if not 5.0 <= duration <= 6.0:
+          ffprobe -v error \
+            -show_entries stream=sample_rate,channels:format=duration \
+            -of json data/private/voice_001_ref.wav \
+            > data/private/reference_info.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          info = json.loads(Path('data/private/reference_info.json').read_text())
+          duration = float(info['format']['duration'])
+          stream = info['streams'][0]
+          if not 39.0 <= duration <= 41.0:
               raise SystemExit(f'Unexpected reference duration: {duration:.3f}s')
-          print(f'Validated compact reference: {duration:.3f}s')
+          if int(stream['channels']) != 1 or int(stream['sample_rate']) != 24000:
+              raise SystemExit(f'Unexpected reference format: {stream}')
+          print(f'Validated reference: {duration:.3f}s, mono, 24 kHz')
           PY
           openssl enc -aes-256-cbc -pbkdf2 -iter 250000 -salt \
             -in data/private/voice_001_ref.wav \
             -out data/private/voice_001_ref.wav.enc \
             -pass env:VOICE_001_KEY
+          test -s data/private/voice_001_ref.wav.enc
           rm -f data/private/reference.opus.enc \
             data/private/reference.opus \
-            data/private/voice_001_ref.wav
+            data/private/voice_001_ref.wav \
+            data/private/reference_info.json
 
-      - name: Save encrypted reference cache
-        if: steps.reference-cache.outputs.cache-hit != 'true'
+      - name: Save corrected encrypted reference cache
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: data/private/voice_001_ref.wav.enc
