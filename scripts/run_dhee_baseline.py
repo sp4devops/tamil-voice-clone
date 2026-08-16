@@ -10,7 +10,6 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 from huggingface_hub import hf_hub_download, snapshot_download
-from transformers import AutoModel
 
 SAMPLE_RATE = 24000
 COMPATIBLE_CONFIG = {
@@ -139,6 +138,8 @@ def validate_waveform(waveform: np.ndarray, case_id: str) -> dict[str, float | i
 
 
 def main() -> None:
+    from transformers import AutoModel
+
     args = parse_args()
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
