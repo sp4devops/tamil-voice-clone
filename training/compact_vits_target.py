@@ -5,8 +5,8 @@ our model budget and maps cleanly onto a YourTTS/VITS-style implementation that
 uses external d-vectors and language embeddings.
 """
 
-from dataclasses import asdict, dataclass
 import json
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 
