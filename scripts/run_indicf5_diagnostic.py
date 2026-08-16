@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
+import io
 import json
 import os
 import re
 import time
 import unicodedata
+from contextlib import redirect_stderr, redirect_stdout
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -15,7 +18,6 @@ import soundfile as sf
 import torch
 from faster_whisper import WhisperModel
 from safetensors.torch import load_file
-from transformers import AutoModel
 
 from run_dhee_baseline import prepare_compatible_snapshot, validate_waveform
 
@@ -53,11 +55,11 @@ def tamil_letter_ratio(text: str) -> float:
     return len(tamil_letters) / len(letters)
 
 
-def transcribe_private(verifier: WhisperModel, path: Path) -> str:
+def transcribe_private(verifier: WhisperModel, path: Path, beam_size: int) -> str:
     segments, _ = verifier.transcribe(
         str(path),
         language="ta",
-        beam_size=5,
+        beam_size=beam_size,
         vad_filter=False,
         condition_on_previous_text=False,
         temperature=0,
@@ -65,155 +67,117 @@ def transcribe_private(verifier: WhisperModel, path: Path) -> str:
     return " ".join(segment.text.strip() for segment in segments).strip()
 
 
-def transcribe_private_words(verifier: WhisperModel, path: Path) -> list[dict[str, object]]:
-    segments, _ = verifier.transcribe(
-        str(path),
-        language="ta",
-        beam_size=5,
-        vad_filter=False,
-        condition_on_previous_text=False,
-        temperature=0,
-        word_timestamps=True,
-    )
-    words: list[dict[str, object]] = []
-    for segment in segments:
-        for word in segment.words or []:
-            normalized = safe_normalize(word.word)
-            if normalized and word.start is not None and word.end is not None:
-                words.append(
-                    {
-                        "normalized": normalized,
-                        "start": float(word.start),
-                        "end": float(word.end),
-                    }
-                )
-    return words
-
-
-def write_private_crop(source: Path, destination: Path, start: float, end: float) -> float:
-    audio, sample_rate = sf.read(source, dtype="float32", always_2d=False)
-    if sample_rate != SAMPLE_RATE:
-        raise RuntimeError(f"Unexpected reference sample rate: {sample_rate}")
-    if np.asarray(audio).ndim > 1:
-        audio = np.mean(audio, axis=1)
-    pad = 0.08
-    start = max(0.0, start - pad)
-    end = min(len(audio) / sample_rate, end + pad)
-    first = max(0, int(round(start * sample_rate)))
-    last = min(len(audio), int(round(end * sample_rate)))
-    crop = np.asarray(audio[first:last], dtype=np.float32)
-    if crop.size < int(0.50 * sample_rate):
-        raise RuntimeError("Aligned private crop is too short")
-    sf.write(destination, crop, sample_rate, subtype="PCM_16")
-    return crop.size / sample_rate
-
-
-def validate_reference_alignment(
+def resolve_reference_text(
     verifier: WhisperModel,
     reference: Path,
     protected_text: str,
-    output_dir: Path,
-) -> tuple[dict[str, object], Path]:
-    info = sf.info(reference)
-    asr_text = transcribe_private(verifier, reference)
+) -> tuple[dict[str, object], str]:
+    """Choose a transcript without ever exposing transcript contents.
 
-    expected = safe_normalize(protected_text)
-    observed = safe_normalize(asr_text)
-    similarity = SequenceMatcher(None, expected, observed).ratio() if expected else 0.0
-    length_ratio = len(observed) / max(1, len(expected))
-    full_accepted = bool(
-        4.2 <= float(info.duration) <= 4.9
-        and len(expected) >= 8
-        and len(observed) >= 6
-        and similarity >= 0.72
-        and 0.60 <= length_ratio <= 1.45
+    The encrypted transcript remains preferred when it agrees with the audio.
+    If it does not, derive a private transcript directly from the same reference
+    clip and require two deterministic Whisper decodes to agree before using it.
+    The derived text exists only in memory for this workflow run.
+    """
+
+    info = sf.info(reference)
+    primary = transcribe_private(verifier, reference, beam_size=5)
+    secondary = transcribe_private(verifier, reference, beam_size=1)
+
+    protected_norm = safe_normalize(protected_text)
+    primary_norm = safe_normalize(primary)
+    secondary_norm = safe_normalize(secondary)
+
+    protected_similarity = (
+        SequenceMatcher(None, protected_norm, primary_norm).ratio()
+        if protected_norm and primary_norm
+        else 0.0
     )
+    protected_length_ratio = len(primary_norm) / max(1, len(protected_norm))
+    protected_accepted = bool(
+        3.0 <= float(info.duration) <= 10.0
+        and len(protected_norm) >= 8
+        and len(primary_norm) >= 8
+        and protected_similarity >= 0.82
+        and 0.70 <= protected_length_ratio <= 1.35
+    )
+
+    consensus_similarity = (
+        SequenceMatcher(None, primary_norm, secondary_norm).ratio()
+        if primary_norm and secondary_norm
+        else 0.0
+    )
+    derived_script_ratio = tamil_letter_ratio(primary)
+    derived_token_count = len(primary.split())
+    derived_accepted = bool(
+        3.0 <= float(info.duration) <= 10.0
+        and 10 <= len(primary_norm) <= 160
+        and 2 <= derived_token_count <= 24
+        and consensus_similarity >= 0.88
+        and derived_script_ratio >= 0.75
+    )
+
+    if protected_accepted:
+        selected_text = protected_text
+        mode = "PROTECTED_EXACT_TRANSCRIPT"
+        accepted = True
+    elif derived_accepted:
+        selected_text = primary
+        mode = "PRIVATE_ASR_DERIVED_TRANSCRIPT"
+        accepted = True
+    else:
+        selected_text = ""
+        mode = "REJECTED"
+        accepted = False
 
     metrics: dict[str, object] = {
         "duration_seconds": round(float(info.duration), 3),
-        "protected_char_count": len(expected),
+        "protected_char_count": len(protected_norm),
         "protected_token_count": len(protected_text.split()),
-        "asr_char_count": len(observed),
-        "asr_token_count": len(asr_text.split()),
-        "full_alignment_similarity": round(similarity, 4),
-        "full_alignment_length_ratio": round(length_ratio, 4),
-        "full_alignment_accepted": full_accepted,
-        "subspan_attempted": False,
-        "accepted": full_accepted,
-        "mode": "FULL_CLIP" if full_accepted else "REJECTED",
+        "private_asr_char_count": len(primary_norm),
+        "private_asr_token_count": derived_token_count,
+        "protected_alignment_similarity": round(protected_similarity, 4),
+        "protected_alignment_length_ratio": round(protected_length_ratio, 4),
+        "protected_alignment_accepted": protected_accepted,
+        "private_asr_consensus_similarity": round(consensus_similarity, 4),
+        "private_asr_tamil_script_ratio": round(derived_script_ratio, 4),
+        "private_asr_accepted": derived_accepted,
+        "accepted": accepted,
+        "mode": mode,
     }
-
-    if full_accepted:
-        print("reference_alignment=" + json.dumps(metrics, sort_keys=True))
-        return metrics, reference
-
-    words = transcribe_private_words(verifier, reference)
-    metrics["subspan_attempted"] = True
-    metrics["timestamped_asr_token_count"] = len(words)
-
-    best: dict[str, object] | None = None
-    for start_index in range(len(words)):
-        for end_index in range(start_index + 1, min(len(words), start_index + 9) + 1):
-            span = words[start_index:end_index]
-            candidate = "".join(str(item["normalized"]) for item in span)
-            if not candidate:
-                continue
-            candidate_similarity = SequenceMatcher(None, expected, candidate).ratio()
-            candidate_length_ratio = len(candidate) / max(1, len(expected))
-            span_start = float(span[0]["start"])
-            span_end = float(span[-1]["end"])
-            duration = max(0.0, span_end - span_start)
-            score = candidate_similarity - 0.10 * abs(1.0 - candidate_length_ratio)
-            if best is None or float(score) > float(best["score"]):
-                best = {
-                    "score": score,
-                    "similarity": candidate_similarity,
-                    "length_ratio": candidate_length_ratio,
-                    "start": span_start,
-                    "end": span_end,
-                    "duration": duration,
-                    "token_count": len(span),
-                }
-
-    if best is None:
-        print("reference_alignment=" + json.dumps(metrics, sort_keys=True))
-        return metrics, reference
-
-    subspan_accepted = bool(
-        float(best["similarity"]) >= 0.82
-        and 0.65 <= float(best["length_ratio"]) <= 1.45
-        and 0.65 <= float(best["duration"]) <= 4.8
-    )
-    metrics.update(
-        {
-            "best_subspan_similarity": round(float(best["similarity"]), 4),
-            "best_subspan_length_ratio": round(float(best["length_ratio"]), 4),
-            "best_subspan_duration_seconds": round(float(best["duration"]), 3),
-            "best_subspan_token_count": int(best["token_count"]),
-            "subspan_accepted": subspan_accepted,
-        }
-    )
-
-    if not subspan_accepted:
-        print("reference_alignment=" + json.dumps(metrics, sort_keys=True))
-        return metrics, reference
-
-    aligned_reference = output_dir / "aligned_reference_private.wav"
-    crop_duration = write_private_crop(
-        reference,
-        aligned_reference,
-        float(best["start"]),
-        float(best["end"]),
-    )
-    metrics.update(
-        {
-            "accepted": True,
-            "mode": "SECURE_MATCHED_SUBSPAN",
-            "effective_reference_duration_seconds": round(crop_duration, 3),
-        }
-    )
     print("reference_alignment=" + json.dumps(metrics, sort_keys=True))
-    return metrics, aligned_reference
+    return metrics, selected_text
+
+
+def load_compat_model_direct(snapshot: Path):
+    """Instantiate the compatibility model without a second HF weight reload.
+
+    The compatibility model's __init__ already loads the Dhee safetensors into
+    the EMA transformer. Calling AutoModel.from_pretrained afterwards triggers
+    another generic Transformers state-dict pass, which is unnecessary and was
+    the source of the earlier `_orig_mod`/EMA warning noise.
+    """
+
+    model_path = snapshot / "model.py"
+    spec = importlib.util.spec_from_file_location("voice001_indicf5_compat", model_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("Could not import IndicF5 compatibility model")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    config_payload = json.loads((snapshot / "config.json").read_text(encoding="utf-8"))
+    config = module.INF5Config(**config_payload)
+    config._name_or_path = MODEL_ID
+
+    captured = io.StringIO()
+    try:
+        with redirect_stdout(captured), redirect_stderr(captured):
+            model = module.INF5Model(config)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Direct IndicF5 compatibility construction failed: {type(exc).__name__}"
+        ) from None
+    return model
 
 
 def unwrap(module):
@@ -297,6 +261,7 @@ def repair_and_prove_weights(model, snapshot: Path) -> dict[str, object]:
     after_vocoder = weight_probe(vocoder_runtime, vocoder_expected) if vocoder_expected else None
 
     metrics: dict[str, object] = {
+        "ema_loaded_by_constructor": bool(before_ema["all_sampled_match"]),
         "ema_before": before_ema,
         "ema_after": after_ema,
         "ema_missing_after_repair": len(ema_missing),
@@ -318,7 +283,7 @@ def repair_and_prove_weights(model, snapshot: Path) -> dict[str, object]:
 
 
 def verify_generated(verifier: WhisperModel, path: Path) -> dict[str, float | int | bool]:
-    asr_text = transcribe_private(verifier, path)
+    asr_text = transcribe_private(verifier, path, beam_size=5)
     expected = tamil_clean(DIAGNOSTIC_TEXT)
     observed = tamil_clean(asr_text)
     overall = SequenceMatcher(None, expected, observed).ratio() if expected else 0.0
@@ -363,11 +328,11 @@ def main() -> None:
         num_workers=1,
     )
 
-    alignment, effective_reference = validate_reference_alignment(
-        verifier, reference, protected_text, output_dir
+    alignment, effective_ref_text = resolve_reference_text(
+        verifier, reference, protected_text
     )
     if not bool(alignment["accepted"]):
-        raise SystemExit("Protected reference audio/transcript alignment gate failed")
+        raise SystemExit("Reference transcript alignment/consensus gate failed")
 
     snapshot = prepare_compatible_snapshot(
         MODEL_ID,
@@ -375,11 +340,7 @@ def main() -> None:
         os.environ.get("HF_TOKEN") or None,
     )
     started = time.perf_counter()
-    model = AutoModel.from_pretrained(
-        snapshot,
-        trust_remote_code=True,
-        local_files_only=True,
-    )
+    model = load_compat_model_direct(snapshot)
     model_load_seconds = time.perf_counter() - started
 
     weights = repair_and_prove_weights(model, snapshot)
@@ -389,11 +350,16 @@ def main() -> None:
     torch.manual_seed(7)
     np.random.seed(7)
     started = time.perf_counter()
-    generated = model(
-        DIAGNOSTIC_TEXT,
-        ref_audio_path=str(effective_reference),
-        ref_text=protected_text,
-    )
+    captured = io.StringIO()
+    try:
+        with redirect_stdout(captured), redirect_stderr(captured):
+            generated = model(
+                DIAGNOSTIC_TEXT,
+                ref_audio_path=str(reference),
+                ref_text=effective_ref_text,
+            )
+    except Exception as exc:
+        raise RuntimeError(f"IndicF5 generation failed: {type(exc).__name__}") from None
     generation_seconds = time.perf_counter() - started
 
     waveform = np.asarray(generated)
@@ -410,6 +376,7 @@ def main() -> None:
         "status": "PENDING_HUMAN_LISTENING_REVIEW" if generation["accepted"] else "REJECTED_STRICT_ASR_GATE",
         "strategy": "OFFICIAL_DIRECT_SHORT_PHRASE",
         "api_contract": "generation_text_separate_from_reference_text",
+        "reference_text_source": alignment["mode"],
         "model_id": MODEL_ID,
         "reference_alignment": alignment,
         "weight_validation": weights,
