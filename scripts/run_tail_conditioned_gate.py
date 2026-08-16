@@ -14,7 +14,7 @@ import torch
 from faster_whisper import WhisperModel
 from transformers import AutoModel
 
-from scripts.run_dhee_baseline import prepare_compatible_snapshot, validate_waveform
+from run_dhee_baseline import prepare_compatible_snapshot, validate_waveform
 
 SAMPLE_RATE = 24000
 TARGET_TEXT = "இது தெளிவான இயல்பான தமிழ் குரல்."
