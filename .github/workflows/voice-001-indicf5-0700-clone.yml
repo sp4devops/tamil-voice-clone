@@ -1,0 +1,249 @@
+name: voice-001-indicf5-0700-clone
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/voice-001-indicf5-0700-clone.yml'
+
+concurrency:
+  group: voice-001-indicf5-0700-clone
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  synthesize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      VIDEO_ID: tY_3TiehDFU
+      START_SECONDS: '420'
+      DURATION_SECONDS: '30'
+      VOICE_001_KEY: ${{ secrets.VOICE_001_KEY }}
+      YOUTUBE_COOKIES_B64: ${{ secrets.YOUTUBE_COOKIES_B64 }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      OMP_NUM_THREADS: '4'
+      MKL_NUM_THREADS: '4'
+      TOKENIZERS_PARALLELISM: 'false'
+
+    steps:
+      - name: Checkout reviewed IndicF5 runner
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: a0414b927782ba97393277ed41dd7c9814f8bbbf
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.10'
+
+      - name: Install audio, transcription, and IndicF5 dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg jq curl
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu \
+            'torch==2.6.0' 'torchaudio==2.6.0'
+          pip install \
+            'transformers==4.49.0' \
+            'accelerate==0.33.0' \
+            'numpy==1.26.4' \
+            'soundfile>=0.12,<1' \
+            'huggingface-hub>=0.27,<1' \
+            'safetensors>=0.4.5' \
+            'vocos==0.1.0' \
+            'pydub==0.25.1' \
+            'librosa>=0.10.2,<1' \
+            'matplotlib>=3.8,<4' \
+            'torchdiffeq>=0.2.4' \
+            'ema-pytorch>=0.5.2' \
+            'x-transformers>=1.31.14' \
+            'faster-whisper==1.2.0' \
+            'yt-dlp>=2026.8.1' \
+            cached_path click hydra-core jieba pypinyin tomli tqdm
+          pip install --no-deps \
+            git+https://github.com/AI4Bharat/IndicF5.git@13f7c4d627cc10111aea8fe9c0039462cacacdc7
+          python - <<'PY'
+          from pathlib import Path
+          import f5_tts
+
+          model_init = Path(f5_tts.__file__).parent / 'model' / '__init__.py'
+          source = model_init.read_text(encoding='utf-8')
+          source = source.replace('from f5_tts.model.trainer import Trainer\n', '')
+          source = source.replace(', "Trainer"', '')
+          model_init.write_text(source, encoding='utf-8')
+          PY
+
+      - name: Validate encryption key
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$VOICE_001_KEY"
+
+      - name: Retrieve exact 07:00-07:30 source segment
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data/private outputs/voice_001_indicf5_0700
+
+          downloaded=0
+          for api in \
+            https://api.piped.private.coffee \
+            https://pipedapi.wireway.ch \
+            https://pipedapi.leptons.xyz \
+            https://piped-api.privacy.com.de
+          do
+            echo "Trying public stream backend: $api"
+            if curl -fsSL --retry 2 --connect-timeout 15 \
+              "$api/streams/$VIDEO_ID" -o data/private/streams.json; then
+              audio_url="$(jq -r '
+                [.audioStreams[]? | select(.url != null and .url != "")]
+                | sort_by(.bitrate // 0) | reverse | .[0].url // empty
+              ' data/private/streams.json)"
+              if [ -n "$audio_url" ] && curl -fL --retry 3 --connect-timeout 20 \
+                -A 'Mozilla/5.0' "$audio_url" -o data/private/source_audio; then
+                downloaded=1
+                break
+              fi
+            fi
+          done
+
+          if [ "$downloaded" -ne 1 ] && [ -n "${YOUTUBE_COOKIES_B64:-}" ]; then
+            echo 'Public stream backends failed; trying protected yt-dlp fallback.'
+            printf '%s' "$YOUTUBE_COOKIES_B64" | base64 --decode > data/private/cookies.txt
+            yt-dlp \
+              --cookies data/private/cookies.txt \
+              --no-playlist \
+              --extractor-args 'youtube:player_client=web,android_vr' \
+              -f 'bestaudio/best' \
+              -o data/private/source_audio \
+              "https://www.youtube.com/watch?v=$VIDEO_ID"
+            downloaded=1
+          fi
+
+          test "$downloaded" -eq 1
+          ffmpeg -y -hide_banner -loglevel error \
+            -ss "$START_SECONDS" -t "$DURATION_SECONDS" \
+            -i data/private/source_audio \
+            -af 'highpass=f=60,lowpass=f=11000,loudnorm=I=-18:TP=-2:LRA=7' \
+            -ac 1 -ar 24000 -c:a pcm_s16le \
+            data/private/voice_001_ref_0700_0730.wav
+
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          import soundfile as sf
+
+          path = Path('data/private/voice_001_ref_0700_0730.wav')
+          audio, rate = sf.read(path)
+          duration = len(audio) / rate
+          if rate != 24000:
+              raise SystemExit(f'Unexpected sample rate: {rate}')
+          if getattr(audio, 'ndim', 1) != 1:
+              raise SystemExit('Reference is not mono')
+          if not 29.5 <= duration <= 30.5:
+              raise SystemExit(f'Unexpected reference duration: {duration:.3f}s')
+          if float(abs(audio).max()) < 0.02 or float(audio.std()) < 0.005:
+              raise SystemExit('Reference appears silent or unusable')
+
+          metadata = {
+              'video_id': 'tY_3TiehDFU',
+              'start_seconds': 420,
+              'end_seconds': 450,
+              'duration_seconds': duration,
+              'sample_rate': rate,
+              'channels': 1,
+          }
+          Path('outputs/voice_001_indicf5_0700/reference_metadata.json').write_text(
+              json.dumps(metadata, indent=2), encoding='utf-8'
+          )
+          print(f'Validated exact reference window: {duration:.3f}s, mono, {rate} Hz')
+          PY
+
+      - name: Recover private reference transcript
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          from faster_whisper import WhisperModel
+
+          model = WhisperModel(
+              'large-v3-turbo',
+              device='cpu',
+              compute_type='int8',
+              cpu_threads=4,
+              num_workers=1,
+          )
+          segments, info = model.transcribe(
+              'data/private/voice_001_ref_0700_0730.wav',
+              language='ta',
+              beam_size=5,
+              vad_filter=True,
+              condition_on_previous_text=True,
+          )
+          text = ' '.join(segment.text.strip() for segment in segments if segment.text.strip())
+          if len(text) < 20:
+              raise SystemExit('Recovered transcript is unexpectedly short')
+          Path('data/private/voice_001_ref_0700_0730.txt').write_text(text, encoding='utf-8')
+          print(f'Recovered private Tamil transcript ({len(text)} characters); content not logged.')
+          PY
+
+      - name: Generate one Tamil cloned-voice gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > data/private/cases.json <<'JSON'
+          {
+            "voice_id": "voice_001_0700_0730",
+            "cases": [
+              {
+                "id": "tamil_clone_0700_gate",
+                "language": "ta",
+                "text": "இந்த அமைப்பு தமிழ் சொற்களை இயல்பான உச்சரிப்பில் பேசுகிறதா என்று பார்க்கிறோம்."
+              }
+            ]
+          }
+          JSON
+
+          python scripts/run_dhee_baseline.py \
+            --reference data/private/voice_001_ref_0700_0730.wav \
+            --reference-text "$(cat data/private/voice_001_ref_0700_0730.txt)" \
+            --cases data/private/cases.json \
+            --compat-model-id AbhishekDelMundu/IndicF5 \
+            --output-dir outputs/voice_001_indicf5_0700
+
+      - name: Validate, encrypt, and remove private material
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s outputs/voice_001_indicf5_0700/tamil_clone_0700_gate.wav
+          ffprobe -v error -select_streams a:0 \
+            -show_entries stream=sample_rate,channels,duration \
+            -of default=noprint_wrappers=1 \
+            outputs/voice_001_indicf5_0700/tamil_clone_0700_gate.wav
+
+          tar -czf outputs/voice_001_indicf5_0700.tar.gz \
+            -C outputs voice_001_indicf5_0700
+          openssl enc -aes-256-cbc -pbkdf2 -iter 250000 -salt \
+            -in outputs/voice_001_indicf5_0700.tar.gz \
+            -out outputs/voice_001_indicf5_0700.tar.gz.enc \
+            -pass env:VOICE_001_KEY
+
+          rm -rf \
+            data/private \
+            outputs/voice_001_indicf5_0700 \
+            outputs/voice_001_indicf5_0700.tar.gz
+
+      - name: Upload encrypted Tamil gate only
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: voice-001-indicf5-0700-clone-encrypted
+          path: outputs/voice_001_indicf5_0700.tar.gz.enc
+          if-no-files-found: error
+          retention-days: 1
