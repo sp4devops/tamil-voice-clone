@@ -65,9 +65,55 @@ def transcribe_private(verifier: WhisperModel, path: Path) -> str:
     return " ".join(segment.text.strip() for segment in segments).strip()
 
 
+def transcribe_private_words(verifier: WhisperModel, path: Path) -> list[dict[str, object]]:
+    segments, _ = verifier.transcribe(
+        str(path),
+        language="ta",
+        beam_size=5,
+        vad_filter=False,
+        condition_on_previous_text=False,
+        temperature=0,
+        word_timestamps=True,
+    )
+    words: list[dict[str, object]] = []
+    for segment in segments:
+        for word in segment.words or []:
+            normalized = safe_normalize(word.word)
+            if normalized and word.start is not None and word.end is not None:
+                words.append(
+                    {
+                        "normalized": normalized,
+                        "start": float(word.start),
+                        "end": float(word.end),
+                    }
+                )
+    return words
+
+
+def write_private_crop(source: Path, destination: Path, start: float, end: float) -> float:
+    audio, sample_rate = sf.read(source, dtype="float32", always_2d=False)
+    if sample_rate != SAMPLE_RATE:
+        raise RuntimeError(f"Unexpected reference sample rate: {sample_rate}")
+    if np.asarray(audio).ndim > 1:
+        audio = np.mean(audio, axis=1)
+    pad = 0.08
+    start = max(0.0, start - pad)
+    end = min(len(audio) / sample_rate, end + pad)
+    first = max(0, int(round(start * sample_rate)))
+    last = min(len(audio), int(round(end * sample_rate)))
+    crop = np.asarray(audio[first:last], dtype=np.float32)
+    if crop.size < int(0.50 * sample_rate):
+        raise RuntimeError("Aligned private crop is too short")
+    sf.write(destination, crop, sample_rate, subtype="PCM_16")
+    return crop.size / sample_rate
+
+
 def validate_reference_alignment(
-    verifier: WhisperModel, reference: Path, protected_text: str
-) -> dict[str, float | int | bool]:
+    verifier: WhisperModel,
+    reference: Path,
+    protected_text: str,
+    output_dir: Path,
+) -> tuple[dict[str, object], Path]:
     info = sf.info(reference)
     asr_text = transcribe_private(verifier, reference)
 
@@ -75,24 +121,99 @@ def validate_reference_alignment(
     observed = safe_normalize(asr_text)
     similarity = SequenceMatcher(None, expected, observed).ratio() if expected else 0.0
     length_ratio = len(observed) / max(1, len(expected))
-    metrics = {
+    full_accepted = bool(
+        4.2 <= float(info.duration) <= 4.9
+        and len(expected) >= 8
+        and len(observed) >= 6
+        and similarity >= 0.72
+        and 0.60 <= length_ratio <= 1.45
+    )
+
+    metrics: dict[str, object] = {
         "duration_seconds": round(float(info.duration), 3),
         "protected_char_count": len(expected),
         "protected_token_count": len(protected_text.split()),
         "asr_char_count": len(observed),
         "asr_token_count": len(asr_text.split()),
-        "alignment_similarity": round(similarity, 4),
-        "alignment_length_ratio": round(length_ratio, 4),
-        "accepted": bool(
-            4.2 <= float(info.duration) <= 4.9
-            and len(expected) >= 8
-            and len(observed) >= 6
-            and similarity >= 0.72
-            and 0.60 <= length_ratio <= 1.45
-        ),
+        "full_alignment_similarity": round(similarity, 4),
+        "full_alignment_length_ratio": round(length_ratio, 4),
+        "full_alignment_accepted": full_accepted,
+        "subspan_attempted": False,
+        "accepted": full_accepted,
+        "mode": "FULL_CLIP" if full_accepted else "REJECTED",
     }
+
+    if full_accepted:
+        print("reference_alignment=" + json.dumps(metrics, sort_keys=True))
+        return metrics, reference
+
+    words = transcribe_private_words(verifier, reference)
+    metrics["subspan_attempted"] = True
+    metrics["timestamped_asr_token_count"] = len(words)
+
+    best: dict[str, object] | None = None
+    for start_index in range(len(words)):
+        for end_index in range(start_index + 1, min(len(words), start_index + 9) + 1):
+            span = words[start_index:end_index]
+            candidate = "".join(str(item["normalized"]) for item in span)
+            if not candidate:
+                continue
+            candidate_similarity = SequenceMatcher(None, expected, candidate).ratio()
+            candidate_length_ratio = len(candidate) / max(1, len(expected))
+            span_start = float(span[0]["start"])
+            span_end = float(span[-1]["end"])
+            duration = max(0.0, span_end - span_start)
+            score = candidate_similarity - 0.10 * abs(1.0 - candidate_length_ratio)
+            if best is None or float(score) > float(best["score"]):
+                best = {
+                    "score": score,
+                    "similarity": candidate_similarity,
+                    "length_ratio": candidate_length_ratio,
+                    "start": span_start,
+                    "end": span_end,
+                    "duration": duration,
+                    "token_count": len(span),
+                }
+
+    if best is None:
+        print("reference_alignment=" + json.dumps(metrics, sort_keys=True))
+        return metrics, reference
+
+    subspan_accepted = bool(
+        float(best["similarity"]) >= 0.82
+        and 0.65 <= float(best["length_ratio"]) <= 1.45
+        and 0.65 <= float(best["duration"]) <= 4.8
+    )
+    metrics.update(
+        {
+            "best_subspan_similarity": round(float(best["similarity"]), 4),
+            "best_subspan_length_ratio": round(float(best["length_ratio"]), 4),
+            "best_subspan_duration_seconds": round(float(best["duration"]), 3),
+            "best_subspan_token_count": int(best["token_count"]),
+            "subspan_accepted": subspan_accepted,
+        }
+    )
+
+    if not subspan_accepted:
+        print("reference_alignment=" + json.dumps(metrics, sort_keys=True))
+        return metrics, reference
+
+    aligned_reference = output_dir / "aligned_reference_private.wav"
+    crop_duration = write_private_crop(
+        reference,
+        aligned_reference,
+        float(best["start"]),
+        float(best["end"]),
+    )
+    metrics.update(
+        {
+            "accepted": True,
+            "mode": "SECURE_MATCHED_SUBSPAN",
+            "effective_reference_duration_seconds": round(crop_duration, 3),
+        }
+    )
     print("reference_alignment=" + json.dumps(metrics, sort_keys=True))
-    return metrics
+    return metrics, aligned_reference
 
 
 def unwrap(module):
@@ -242,8 +363,10 @@ def main() -> None:
         num_workers=1,
     )
 
-    alignment = validate_reference_alignment(verifier, reference, protected_text)
-    if not alignment["accepted"]:
+    alignment, effective_reference = validate_reference_alignment(
+        verifier, reference, protected_text, output_dir
+    )
+    if not bool(alignment["accepted"]):
         raise SystemExit("Protected reference audio/transcript alignment gate failed")
 
     snapshot = prepare_compatible_snapshot(
@@ -268,7 +391,7 @@ def main() -> None:
     started = time.perf_counter()
     generated = model(
         DIAGNOSTIC_TEXT,
-        ref_audio_path=str(reference),
+        ref_audio_path=str(effective_reference),
         ref_text=protected_text,
     )
     generation_seconds = time.perf_counter() - started
