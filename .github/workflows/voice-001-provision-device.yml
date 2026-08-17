@@ -1,0 +1,108 @@
+name: voice-001-provision-device
+run-name: Provision original voice ${{ inputs.request_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      device_recipient:
+        description: Temporary age recipient generated on the target Mac
+        required: true
+        type: string
+      request_id:
+        description: Unique provisioning request id
+        required: true
+        type: string
+
+concurrency:
+  group: voice-001-device-provision-${{ inputs.request_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  provision:
+    if: github.actor == 'sp4devops'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      VOICE_001_KEY: ${{ secrets.VOICE_001_KEY }}
+      DEVICE_RECIPIENT: ${{ inputs.device_recipient }}
+      REQUEST_ID: ${{ inputs.request_id }}
+    steps:
+      - name: Checkout protected Stage 1 assets
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Install secure packaging tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends age ffmpeg
+
+      - name: Recover and device-encrypt original reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$VOICE_001_KEY"
+          [[ "$DEVICE_RECIPIENT" == age1* ]]
+          [[ "$REQUEST_ID" =~ ^[a-zA-Z0-9_-]{8,40}$ ]]
+          mkdir -p private outputs
+
+          cat .github/reference/voice_001_ref_exact_4s.opus.enc.b64.part* \
+            | base64 -d > private/reference.opus.enc
+          base64 -d .github/reference/voice_001_ref_exact_4s.txt.enc.b64 \
+            > private/reference.txt.enc
+
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 250000 \
+            -in private/reference.opus.enc \
+            -out private/reference.opus \
+            -pass env:VOICE_001_KEY
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 250000 \
+            -in private/reference.txt.enc \
+            -out private/reference.txt \
+            -pass env:VOICE_001_KEY
+
+          ffmpeg -y -hide_banner -loglevel error \
+            -i private/reference.opus \
+            -ac 1 -ar 24000 -c:a pcm_s16le \
+            private/reference.wav
+
+          python - <<'PY'
+          from pathlib import Path
+          import wave
+          wav = Path('private/reference.wav')
+          text = Path('private/reference.txt').read_text(encoding='utf-8').strip()
+          with wave.open(str(wav), 'rb') as handle:
+              duration = handle.getnframes() / handle.getframerate()
+              if handle.getnchannels() != 1 or handle.getframerate() != 24000:
+                  raise SystemExit('Original reference audio validation failed')
+          if not 4.2 <= duration <= 4.9:
+              raise SystemExit('Original reference duration validation failed')
+          if len(text) < 8 or not any('\u0b80' <= ch <= '\u0bff' for ch in text):
+              raise SystemExit('Original reference transcript validation failed')
+          print('Original reference validation=PASS')
+          PY
+
+          tar -czf private/original-reference.tar.gz \
+            -C private reference.wav reference.txt
+          age -r "$DEVICE_RECIPIENT" \
+            -o "outputs/original-voice-${REQUEST_ID}.tar.gz.age" \
+            private/original-reference.tar.gz
+
+      - name: Remove plaintext reference material
+        if: always()
+        shell: bash
+        run: |
+          rm -rf private
+
+      - name: Upload device-encrypted provisioning bundle
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: original-voice-${{ inputs.request_id }}
+          path: outputs/original-voice-${{ inputs.request_id }}.tar.gz.age
+          if-no-files-found: error
+          retention-days: 1
